@@ -1077,6 +1077,422 @@ def earnings_cmd(update: Update, context: CallbackContext):
     
     update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
 
+# ========== Edit Product Feature ==========
+# New states for editing products
+(EDIT_CHOOSE_ACTION, EDIT_CHANNEL_ID, EDIT_FILES, EDIT_PRICE, EDIT_CONFIRM) = range(300, 305)
+
+def edit_product_start(update: Update, context: CallbackContext):
+    """Handle admin sending a product link for editing"""
+    if update.effective_user.id not in ALL_ADMINS:
+        return
+    
+    # Extract item_id from the link
+    text = update.message.text or ""
+    
+    # Pattern to match bot start links: https://t.me/botusername?start=item_123456789
+    pattern = r'https?://t\.me/([^/?]+)\?start=([a-zA-Z0-9_]+)'
+    match = re.search(pattern, text)
+    
+    if not match:
+        update.message.reply_text("❌ Invalid product link. Send a link like: https://t.me/A04A_bot?start=item_123456789")
+        return ConversationHandler.END
+    
+    bot_username = match.group(1)
+    item_id = match.group(2)
+    
+    # Verify bot username matches
+    if context.bot.username.lower() != bot_username.lower():
+        update.message.reply_text(f"❌ This link is for @{bot_username}, not @{context.bot.username}")
+        return ConversationHandler.END
+    
+    # Get product from database
+    prod = c_products.find_one({"item_id": item_id})
+    if not prod:
+        update.message.reply_text("❌ Product not found.")
+        return ConversationHandler.END
+    
+    # Check if admin owns this product (owner can edit all)
+    added_by = prod.get("added_by")
+    if update.effective_user.id != OWNER_ID and added_by != update.effective_user.id:
+        update.message.reply_text("❌ You can only edit products that you created.")
+        return ConversationHandler.END
+    
+    # Store product info for editing
+    context.user_data['edit_product'] = prod
+    context.user_data['edit_item_id'] = item_id
+    
+    # Show product info and editing options
+    return show_edit_options(update, context)
+
+def show_edit_options(update: Update, context: CallbackContext):
+    """Show current product details and editing options"""
+    prod = context.user_data.get('edit_product', {})
+    item_id = context.user_data.get('edit_item_id', '')
+    
+    # Build product info message
+    message = "🛠️ *Edit Product*\n\n"
+    message += f"*Item ID:* `{item_id}`\n"
+    
+    if 'channel_id' in prod:
+        # Channel product
+        ch_id = prod.get('channel_id', 0)
+        message += f"*Type:* Channel Product\n"
+        message += f"*Channel ID:* `{ch_id}`\n"
+        
+        # Try to get channel title
+        try:
+            chat = update.effective_message.bot.get_chat(ch_id)
+            title = chat.title or "Unknown"
+            message += f"*Channel Title:* {title}\n"
+        except Exception:
+            message += f"*Channel Title:* Unknown (bot may not have access)\n"
+    else:
+        # File product
+        file_count = len(prod.get('files', []))
+        message += f"*Type:* File Product\n"
+        message += f"*Number of files:* {file_count}\n"
+    
+    # Price info
+    if 'price' in prod:
+        message += f"*Price:* ₹{fmt_inr(prod['price'])}\n"
+    elif 'min_price' in prod and 'max_price' in prod:
+        message += f"*Price Range:* ₹{fmt_inr(prod['min_price'])} - ₹{fmt_inr(prod['max_price'])}\n"
+    
+    message += "\n*What would you like to edit?*"
+    
+    # Create buttons based on product type
+    keyboard = []
+    
+    if 'channel_id' in prod:
+        # Channel product options
+        keyboard.append([InlineKeyboardButton("📢 Change Channel ID", callback_data="edit:channel")])
+    else:
+        # File product options
+        keyboard.append([InlineKeyboardButton("📁 Change Files", callback_data="edit:files")])
+    
+    keyboard.append([InlineKeyboardButton("💰 Change Price", callback_data="edit:price")])
+    keyboard.append([InlineKeyboardButton("✅ Save Changes", callback_data="edit:save")])
+    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="edit:cancel")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if update.callback_query:
+        update.callback_query.edit_message_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+    else:
+        update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+    
+    return EDIT_CHOOSE_ACTION
+
+def edit_action_callback(update: Update, context: CallbackContext):
+    """Handle edit action selection"""
+    query = update.callback_query
+    query.answer()
+    data = query.data
+    
+    if data == "edit:channel":
+        query.edit_message_text(
+            "📢 *Change Channel ID*\n\n"
+            "Send the new channel reference (numeric `-100...`, `@username`, or `https://t.me/...`).\n\n"
+            "_Note: The bot must be admin in the new channel._",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return EDIT_CHANNEL_ID
+        
+    elif data == "edit:files":
+        # Start collecting new files
+        context.user_data['edit_new_files'] = []
+        query.edit_message_text(
+            "📁 *Change Files*\n\n"
+            "Send the new files one by one. When finished, click ✅ Done.\n\n"
+            "Files will be stored in the current storage channels.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Done", callback_data="edit:files_done")],
+                [InlineKeyboardButton("❌ Cancel", callback_data="edit:back")]
+            ])
+        )
+        return EDIT_FILES
+        
+    elif data == "edit:price":
+        query.edit_message_text(
+            "💰 *Change Price*\n\n"
+            "Send the new price or price range:\n"
+            "• For fixed price: `10`\n"
+            "• For price range: `10-30`\n"
+            "• For free product: `0`\n\n"
+            "_To keep current price, click Cancel._",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Cancel", callback_data="edit:back")]
+            ])
+        )
+        return EDIT_PRICE
+        
+    elif data == "edit:save":
+        return save_edits(update, context)
+        
+    elif data == "edit:cancel":
+        query.edit_message_text("❌ Editing cancelled.")
+        context.user_data.clear()
+        return ConversationHandler.END
+        
+    elif data == "edit:back":
+        return show_edit_options(update, context)
+        
+    elif data == "edit:files_done":
+        return confirm_file_changes(update, context)
+
+def edit_channel_id(update: Update, context: CallbackContext):
+    """Handle new channel ID input"""
+    text = (update.message.text or "").strip()
+    
+    # Try to resolve channel
+    try:
+        ch_id = _resolve_channel(context, text)
+    except (BadRequest, Unauthorized) as e:
+        update.message.reply_text(f"❌ I couldn't access that channel: {e}")
+        return EDIT_CHANNEL_ID
+    
+    # Check if bot is admin in new channel
+    if not _bot_is_admin(context, ch_id):
+        update.message.reply_text("❌ I'm not an admin in that channel. Add me and try again.")
+        return EDIT_CHANNEL_ID
+    
+    # Update product in context
+    prod = context.user_data.get('edit_product', {})
+    prod['channel_id'] = ch_id
+    context.user_data['edit_product'] = prod
+    
+    # Try to get channel title for confirmation
+    try:
+        chat = update.effective_message.bot.get_chat(ch_id)
+        title = chat.title or "Unknown"
+        update.message.reply_text(f"✅ Channel updated to: `{ch_id}`\n📢 Title: {title}")
+    except Exception:
+        update.message.reply_text(f"✅ Channel updated to: `{ch_id}`")
+    
+    return show_edit_options(update, context)
+
+def edit_files_collect(update: Update, context: CallbackContext):
+    """Collect new files for the product"""
+    if not update.message.effective_attachment:
+        update.message.reply_text("Please send a file (document, photo, or video).")
+        return EDIT_FILES
+    
+    try:
+        # Store file in storage channels (same logic as add product)
+        chs = get_storage_channels()
+        main_id = chs[0]
+        backups = chs[1:]
+        
+        # Forward to main storage
+        fwd = context.bot.forward_message(main_id, update.message.chat_id, update.message.message_id)
+        rec = {"channel_id": fwd.chat_id, "message_id": fwd.message_id, "backups": []}
+        
+        # Mirror to backups
+        for bch in backups:
+            try:
+                cm = context.bot.copy_message(bch, update.message.chat_id, update.message.message_id)
+                rec["backups"].append({"channel_id": cm.chat_id, "message_id": cm.message_id})
+                time.sleep(0.1)
+            except Exception as e:
+                log.error(f"Mirror to backup {bch} failed: {e}")
+        
+        # Add to temporary list
+        if 'edit_new_files' not in context.user_data:
+            context.user_data['edit_new_files'] = []
+        context.user_data['edit_new_files'].append(rec)
+        
+        # Show current count
+        count = len(context.user_data['edit_new_files'])
+        update.message.reply_text(f"✅ File added ({count} total). Send more or click ✅ Done.")
+        
+    except Exception as e:
+        log.error(f"Failed to store file: {e}")
+        update.message.reply_text("❌ Failed to store file. Please try again.")
+    
+    return EDIT_FILES
+
+def confirm_file_changes(update: Update, context: CallbackContext):
+    """Confirm file changes before saving"""
+    new_files = context.user_data.get('edit_new_files', [])
+    old_files = context.user_data.get('edit_product', {}).get('files', [])
+    old_count = len(old_files)
+    new_count = len(new_files)
+    
+    if new_count == 0:
+        update.callback_query.edit_message_text(
+            "❌ No files were added. Please send files or cancel.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Cancel", callback_data="edit:cancel")]
+            ])
+        )
+        return EDIT_FILES
+    
+    message = (
+        f"📁 *File Changes*\n\n"
+        f"• Old files: {old_count}\n"
+        f"• New files: {new_count}\n\n"
+        f"Replace {old_count} files with {new_count} new files?"
+    )
+    
+    keyboard = [
+        [InlineKeyboardButton("✅ Yes, Replace Files", callback_data="edit:confirm_files")],
+        [InlineKeyboardButton("❌ No, Keep Old Files", callback_data="edit:back")]
+    ]
+    
+    update.callback_query.edit_message_text(
+        message,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    
+    return EDIT_CONFIRM
+
+def edit_price_input(update: Update, context: CallbackContext):
+    """Handle new price input"""
+    t = update.message.text.strip()
+    
+    try:
+        if "-" in t:
+            a, b = t.split("-", 1)
+            mn, mx = float(a), float(b)
+            assert mx >= mn and mn >= 0
+        else:
+            v = float(t)
+            assert v >= 0
+            mn = mx = v
+    except:
+        update.message.reply_text("❌ Invalid format. Send like `10` or `10-30`. Send /cancel to abort.")
+        return EDIT_PRICE
+    
+    # Update product in context
+    prod = context.user_data.get('edit_product', {})
+    prod['min_price'] = mn
+    prod['max_price'] = mx
+    if mn == mx:
+        prod['price'] = mn
+    elif 'price' in prod:
+        prod.pop('price', None)
+    
+    context.user_data['edit_product'] = prod
+    
+    if mn == mx:
+        update.message.reply_text(f"✅ Price set to: ₹{fmt_inr(mn)}")
+    else:
+        update.message.reply_text(f"✅ Price range set to: ₹{fmt_inr(mn)} - ₹{fmt_inr(mx)}")
+    
+    return show_edit_options(update, context)
+
+def edit_confirm_callback(update: Update, context: CallbackContext):
+    """Handle confirmation callbacks for editing"""
+    query = update.callback_query
+    query.answer()
+    data = query.data
+    
+    if data == "edit:confirm_files":
+        # Update product in context
+        prod = context.user_data.get('edit_product', {})
+        new_files = context.user_data.get('edit_new_files', [])
+        prod['files'] = new_files
+        context.user_data['edit_product'] = prod
+        
+        # Clear temporary files list
+        context.user_data.pop('edit_new_files', None)
+        
+        query.edit_message_text(f"✅ Files updated. {len(new_files)} files saved.")
+        return show_edit_options(update, context)
+        
+    elif data == "edit:back":
+        return show_edit_options(update, context)
+        
+    elif data == "edit:cancel":
+        query.edit_message_text("❌ Editing cancelled.")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+def save_edits(update: Update, context: CallbackContext):
+    """Save all edits to database"""
+    query = update.callback_query
+    query.answer()
+    
+    prod = context.user_data.get('edit_product', {})
+    item_id = context.user_data.get('edit_item_id', '')
+    
+    if not prod or not item_id:
+        query.edit_message_text("❌ No product data found. Please start over.")
+        context.user_data.clear()
+        return ConversationHandler.END
+    
+    # Update product in database
+    try:
+        # Prepare update document
+        update_doc = {}
+        
+        if 'channel_id' in prod:
+            update_doc['channel_id'] = prod['channel_id']
+        
+        if 'files' in prod:
+            update_doc['files'] = prod['files']
+        
+        if 'price' in prod:
+            update_doc['price'] = prod['price']
+            update_doc.pop('min_price', None)
+            update_doc.pop('max_price', None)
+        elif 'min_price' in prod and 'max_price' in prod:
+            update_doc['min_price'] = prod['min_price']
+            update_doc['max_price'] = prod['max_price']
+            update_doc.pop('price', None)
+        
+        # Perform update
+        result = c_products.update_one(
+            {"item_id": item_id},
+            {"$set": update_doc}
+        )
+        
+        if result.modified_count > 0:
+            # Generate new link
+            new_link = f"https://t.me/{context.bot.username}?start={item_id}"
+            
+            # If files were changed, ensure backups
+            if 'files' in update_doc:
+                # Re-ensure backups for the updated product
+                _ensure_backups_for_product(context, prod)
+            
+            message = (
+                "✅ *Product Updated Successfully!*\n\n"
+                f"*New Link:* `{new_link}`\n\n"
+                "_Changes have been saved to the database._"
+            )
+            
+            query.edit_message_text(message, parse_mode=ParseMode.MARKDOWN)
+            
+            # Log the edit
+            log.info(f"Admin {update.effective_user.id} edited product {item_id}")
+            
+        else:
+            query.edit_message_text("⚠️ No changes were made to the product.")
+            
+    except Exception as e:
+        log.error(f"Failed to update product {item_id}: {e}")
+        query.edit_message_text(f"❌ Failed to save changes: {str(e)}")
+    
+    # Clear context
+    context.user_data.clear()
+    
+    return ConversationHandler.END
+
+def edit_cancel(update: Update, context: CallbackContext):
+    """Cancel editing"""
+    if update.message:
+        update.message.reply_text("❌ Editing cancelled.")
+    elif update.callback_query:
+        update.callback_query.answer()
+        update.callback_query.edit_message_text("❌ Editing cancelled.")
+    
+    context.user_data.clear()
+    return ConversationHandler.END
+
 # ---- Product add (files) ----
 GET_PRODUCT_FILES, PRICE, GET_BROADCAST_FILES, GET_BROADCAST_TEXT, BROADCAST_CONFIRM = range(5)
 
@@ -1861,9 +2277,40 @@ def main():
         name="add_channel_conv",
         persistent=False
     )
+    
+    # Edit product conversation handler
+    edit_conv = ConversationHandler(
+        entry_points=[
+            MessageHandler(Filters.regex(r'https?://t\.me/[^/?]+\?start=item_\d+') & admin, edit_product_start)
+        ],
+        states={
+            EDIT_CHOOSE_ACTION: [
+                CallbackQueryHandler(edit_action_callback, pattern=r'^edit:(channel|files|price|save|cancel|back|files_done)$')
+            ],
+            EDIT_CHANNEL_ID: [
+                MessageHandler(Filters.text & ~Filters.command, edit_channel_id),
+                CommandHandler('cancel', edit_cancel)
+            ],
+            EDIT_FILES: [
+                MessageHandler((Filters.document | Filters.video | Filters.photo) & ~Filters.command, edit_files_collect),
+                CallbackQueryHandler(edit_action_callback, pattern=r'^edit:(files_done|back|cancel)$')
+            ],
+            EDIT_PRICE: [
+                MessageHandler(Filters.text & ~Filters.command, edit_price_input),
+                CommandHandler('cancel', edit_cancel)
+            ],
+            EDIT_CONFIRM: [
+                CallbackQueryHandler(edit_confirm_callback, pattern=r'^edit:(confirm_files|back|cancel)$')
+            ]
+        },
+        fallbacks=[CommandHandler('cancel', edit_cancel)],
+        name="edit_product_conv",
+        persistent=False
+    )
 
     dp.add_handler(add_conv, group=0)
     dp.add_handler(add_channel_conv, group=0)
+    dp.add_handler(edit_conv, group=0)
 
     # Broadcast & misc
     dp.add_handler(CommandHandler("broadcast", bc_start, filters=admin))
