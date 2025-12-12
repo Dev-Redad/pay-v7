@@ -41,7 +41,7 @@ logging.basicConfig(format="%(asctime)s %(levelname)s:%(name)s: %(message)s", le
 log = logging.getLogger("upi-mongo-bot")
 
 # === Bot token (updated as requested) ===
-TOKEN = "8352423948:AAEP_WHdxNGziUabzMwO9_YiEp24_d0XYVk"
+TOKEN = "7303696543:AAHLYJyc-dD4OJOilv2dlgAspyYGgWAmNYQ"
 
 # === Owner and Admins (updated as requested) ===
 OWNER_ID = 7381642564  # Owner has full access including /settings
