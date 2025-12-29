@@ -45,7 +45,7 @@ TOKEN = "7303696543:AAEzn6YVIhNmDz6jeKkW9vRfrpzoylIsU78"
 
 # === Owner and Admins (updated as requested) ===
 OWNER_ID = 7381642564  # Owner has full access including /settings
-ADMIN_IDS = [7223414109, 6053105336, 7748361879]  # Admins have all features except /settings
+ADMIN_IDS = [5860915865, 7223414109, 6053105336, 7748361879]  # Admins have all features except /settings
 ALL_ADMINS = [OWNER_ID] + ADMIN_IDS  # Combined list for admin checks
 
 # --- Storage (database) channels ---
