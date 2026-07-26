@@ -22,8 +22,10 @@
 # - IMPROVEMENT: backup reference parsing is lenient (works even with extra words).
 # - IMPROVEMENT: auto-resync runs after ⭐ Make Main as a safety net.
 
-import os, logging, time, random, re, unicodedata, html, threading, queue
+import os, logging, time, random, re, unicodedata, html, threading, queue, hashlib
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from urllib.parse import quote
 
 from telegram import Update, ParseMode, InlineKeyboardButton, InlineKeyboardMarkup, Bot
@@ -35,19 +37,92 @@ from telegram.ext import (
 from telegram.error import BadRequest, Unauthorized, RetryAfter, TimedOut, NetworkError
 from telegram.utils.request import Request
 
-from pymongo import MongoClient, ASCENDING
+from pymongo import MongoClient, ASCENDING, ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 logging.basicConfig(format="%(asctime)s %(levelname)s:%(name)s: %(message)s", level=logging.INFO)
+
+_BOT_TOKEN_LOG_RE = re.compile(r"bot\d+:[A-Za-z0-9_-]+")
+
+class _TelegramTokenLogFilter(logging.Filter):
+    def filter(self, record):
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        redacted = _BOT_TOKEN_LOG_RE.sub("bot<redacted>", message)
+        if redacted != message:
+            record.msg = redacted
+            record.args = ()
+        return True
+
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(_TelegramTokenLogFilter())
+logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
+
 log = logging.getLogger("upi-mongo-bot")
 
+
+def _parse_env_int_list(name, default):
+    raw = os.getenv(name)
+    if not raw:
+        return list(default)
+
+    parsed = []
+    seen = set()
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            value = int(token)
+        except ValueError:
+            continue
+        if value in seen:
+            continue
+        seen.add(value)
+        parsed.append(value)
+
+    return parsed or list(default)
+
+def _parse_env_int(name, default, minimum=None, maximum=None):
+    try:
+        value = int((os.getenv(name) or "").strip())
+    except Exception:
+        value = int(default)
+    if minimum is not None:
+        value = max(int(minimum), value)
+    if maximum is not None:
+        value = min(int(maximum), value)
+    return value
+
+def _parse_env_float(name, default, minimum=None, maximum=None):
+    try:
+        value = float((os.getenv(name) or "").strip())
+    except Exception:
+        value = float(default)
+    if minimum is not None:
+        value = max(float(minimum), value)
+    if maximum is not None:
+        value = min(float(maximum), value)
+    return value
+
+def _parse_env_bool(name, default=False):
+    value = (os.getenv(name) or "").strip().lower()
+    if not value:
+        return bool(default)
+    return value in {"1", "true", "yes", "on"}
+
 # === Bot token (updated as requested) ===
-TOKEN = "7303696543:AAEzn6YVIhNmDz6jeKkW9vRfrpzoylIsU78"
+TOKEN = os.getenv("BOT_TOKEN", "7303696543:AAEzn6YVIhNmDz6jeKkW9vRfrpzoylIsU78")
 
 # === Owner and Admins (updated as requested) ===
-OWNER_ID = 7381642564  # Owner has full access including /settings
-ADMIN_IDS = [5860915865, 7223414109, 6053105336, 7748361879, 7276257621]  # Admins have all features except /settings
-ALL_ADMINS = [OWNER_ID] + ADMIN_IDS  # Combined list for admin checks
+OWNER_ID = int(os.getenv("OWNER_ID", "7381642564"))  # Owner has full access including /settings
+ADMIN_IDS = _parse_env_int_list(
+    "ADMIN_IDS",
+    [5860915865, 7223414109, 6053105336, 7748361879, 7276257621],
+)  # Admins have all features except /settings
+ALL_ADMINS = [OWNER_ID] + [admin_id for admin_id in ADMIN_IDS if admin_id != OWNER_ID]  # Combined list for admin checks
 
 # --- Storage (database) channels ---
 # The bot uses cfg("storage_channels") → list; first is MAIN and the rest are BACKUPS.
@@ -67,12 +142,30 @@ DELETE_AFTER_MINUTES = 30   # link + short "payment received" auto-deleted after
 SPECIAL_POST_DELETE_MINUTES = 30
 SPECIAL_POST_REPEAT_HOURS = 6
 SPECIAL_POST_DEFAULT_REPEAT_CYCLES = 15
-SPECIAL_POST_SWEEP_BATCH_SIZE = 20
+SPECIAL_POST_SWEEP_BATCH_SIZE = 8
 
 # Options
 PROTECT_CONTENT_ENABLED = False
 FORCE_SUBSCRIBE_ENABLED = True
 FORCE_SUBSCRIBE_CHANNEL_IDS = []
+BOT_REQUEST_CONNECT_TIMEOUT = _parse_env_float("BOT_REQUEST_CONNECT_TIMEOUT", 3.5, minimum=0.5)
+BOT_REQUEST_READ_TIMEOUT = _parse_env_float("BOT_REQUEST_READ_TIMEOUT", 15.0, minimum=1.0)
+BOT_REQUEST_POOL_SIZE = _parse_env_int("BOT_REQUEST_POOL_SIZE", 256, minimum=16, maximum=512)
+UPDATER_WORKER_COUNT = _parse_env_int("UPDATER_WORKER_COUNT", 96, minimum=4, maximum=160)
+START_CONFIG_CACHE_TTL_SECONDS = 30
+STORAGE_TITLE_CACHE_TTL_SECONDS = 600
+HEARTBEAT_PATH = os.getenv("HEARTBEAT_PATH", "/run/pay-v7/heartbeat")
+HEARTBEAT_INTERVAL_SECONDS = 30
+DELIVERY_REQUEST_TIMEOUT = _parse_env_float("DELIVERY_REQUEST_TIMEOUT", 20.0, minimum=1.0)
+DELIVERY_MAX_RETRIES = _parse_env_int("DELIVERY_MAX_RETRIES", 4, minimum=1, maximum=8)
+DELIVERY_NETWORK_RETRY_BASE_SECONDS = _parse_env_float("DELIVERY_NETWORK_RETRY_BASE_SECONDS", 0.5, minimum=0.1)
+DELIVERY_INTER_MESSAGE_DELAY_SECONDS = _parse_env_float("DELIVERY_INTER_MESSAGE_DELAY_SECONDS", 0.25, minimum=0.0)
+_raw_storage_channels_override = os.getenv("STORAGE_CHANNELS")
+STORAGE_CHANNELS_OVERRIDE = (
+    _parse_env_int_list("STORAGE_CHANNELS", [int(STORAGE_CHANNEL_ID)])
+    if _raw_storage_channels_override
+    else None
+)
 
 # Mongo
 MONGO_URI = os.getenv(
@@ -93,15 +186,63 @@ c_earnings  = mdb["earnings"]  # New collection for admin earnings
 c_broadcast_deletes = mdb["broadcast_deletes"]
 c_special_post_cycles = mdb["special_post_cycles"]
 
-# Free broadcast tuning. Keep below Telegram's free global send cap.
-BROADCAST_FREE_MESSAGES_PER_SEC = 28.0
-BROADCAST_WORKERS = 16
-BROADCAST_PROGRESS_UPDATE_SECONDS = 5.0
-BROADCAST_REQUEST_TIMEOUT = 20.0
-BROADCAST_DELETE_BATCH_SIZE = 20
+# Free broadcast tuning. Keep below Telegram's free global send cap and reserve
+# Bot API headroom for live /start traffic during campaign spikes.
+BROADCAST_FREE_MESSAGES_PER_SEC = _parse_env_float("BROADCAST_FREE_MESSAGES_PER_SEC", 18.0, minimum=1.0, maximum=28.0)
+BROADCAST_WORKERS = _parse_env_int("BROADCAST_WORKERS", 16, minimum=1, maximum=64)
+BROADCAST_PROGRESS_UPDATE_SECONDS = _parse_env_float("BROADCAST_PROGRESS_UPDATE_SECONDS", 5.0, minimum=1.0)
+BROADCAST_REQUEST_TIMEOUT = _parse_env_float("BROADCAST_REQUEST_TIMEOUT", 20.0, minimum=1.0)
+BROADCAST_DELETE_BATCH_SIZE = _parse_env_int("BROADCAST_DELETE_BATCH_SIZE", 100, minimum=1, maximum=1000)
+BROADCAST_DELETE_FETCH_CHUNK_SIZE = _parse_env_int("BROADCAST_DELETE_FETCH_CHUNK_SIZE", 25, minimum=1, maximum=250)
+BROADCAST_DELETE_SWEEP_INTERVAL_SECONDS = _parse_env_int("BROADCAST_DELETE_SWEEP_INTERVAL_SECONDS", 10, minimum=1)
+BROADCAST_DELETE_MAX_RUNTIME_SECONDS = _parse_env_float("BROADCAST_DELETE_MAX_RUNTIME_SECONDS", 3.0, minimum=0.5)
+ASYNC_DELIVERY_WORKERS = _parse_env_int("ASYNC_DELIVERY_WORKERS", 48, minimum=1, maximum=96)
+ASYNC_DELIVERY_MAX_PENDING = _parse_env_int("ASYNC_DELIVERY_MAX_PENDING", 100_000, minimum=100, maximum=500_000)
+ASYNC_START_ACK_DELETE_MINUTES = 1
+BOT_API_BASE_URL = (os.getenv("BOT_API_BASE_URL") or "http://127.0.0.1:8081/bot").strip() or None
+BOT_API_BASE_FILE_URL = (os.getenv("BOT_API_BASE_FILE_URL") or "http://127.0.0.1:8081/file/bot").strip() or None
+SEND_START_ACK = _parse_env_bool("SEND_START_ACK", False)
+START_REQUEST_DEDUPE_SECONDS = _parse_env_float("START_REQUEST_DEDUPE_SECONDS", 20.0, minimum=0.0)
+PRODUCT_CACHE_TTL_SECONDS = _parse_env_float("PRODUCT_CACHE_TTL_SECONDS", 10.0, minimum=0.0)
+USER_RECORD_WORKERS = _parse_env_int("USER_RECORD_WORKERS", 2, minimum=1, maximum=8)
+USER_RECORD_QUEUE_MAX = _parse_env_int("USER_RECORD_QUEUE_MAX", 200_000, minimum=100, maximum=500_000)
+POLLING_ALLOWED_UPDATES = ["message", "channel_post", "callback_query", "chat_join_request"]
+BOT_UPDATE_MODE = (os.getenv("BOT_UPDATE_MODE") or "polling").strip().lower()
+WEBHOOK_BASE_URL = (os.getenv("WEBHOOK_BASE_URL") or "").strip().rstrip("/")
+WEBHOOK_DOMAIN = (os.getenv("WEBHOOK_DOMAIN") or "").strip()
+WEBHOOK_LISTEN = (os.getenv("WEBHOOK_LISTEN") or "127.0.0.1").strip()
+WEBHOOK_PORT = _parse_env_int("WEBHOOK_PORT", 8453, minimum=1, maximum=65535)
+WEBHOOK_PATH_PREFIX = (os.getenv("WEBHOOK_PATH_PREFIX") or "makec3m").strip("/")
+WEBHOOK_PATH_SECRET = (
+    os.getenv("WEBHOOK_PATH_SECRET")
+    or hashlib.sha256(f"makec3m:{TOKEN}".encode("utf-8")).hexdigest()
+).strip("/")
+WEBHOOK_URL_PATH = "/" + "/".join(part for part in (WEBHOOK_PATH_PREFIX, WEBHOOK_PATH_SECRET) if part)
+WEBHOOK_MAX_CONNECTIONS = _parse_env_int("WEBHOOK_MAX_CONNECTIONS", 100, minimum=1, maximum=100)
+WEBHOOK_BOOTSTRAP_RETRIES = _parse_env_int("WEBHOOK_BOOTSTRAP_RETRIES", 5, minimum=-1, maximum=100)
+WEBHOOK_DROP_PENDING_UPDATES = _parse_env_bool("WEBHOOK_DROP_PENDING_UPDATES", False)
+WEBHOOK_IP_ADDRESS = (os.getenv("WEBHOOK_IP_ADDRESS") or "").strip() or None
+STALE_DELETE_SKIP_AFTER_MINUTES = 60
+PRIORITY_DELETE_KINDS = ("startmsg", "startack", "admrec")
 
 _broadcast_state_lock = threading.Lock()
 _broadcast_state = {"active": False}
+_async_delivery_pending = 0
+_async_delivery_pending_lock = threading.Lock()
+_recent_start_requests = {}
+_recent_start_lock = threading.Lock()
+_product_cache = {}
+_product_cache_lock = threading.Lock()
+_user_record_queue = queue.Queue(maxsize=USER_RECORD_QUEUE_MAX)
+_user_record_workers_started = False
+_user_record_workers_lock = threading.Lock()
+_storage_title_cache = {}
+_start_post_cache = {"value": None, "expires_at": 0.0}
+_start_message_delete_cache = {"value": 0, "expires_at": 0.0}
+_async_delivery_executor = ThreadPoolExecutor(
+    max_workers=ASYNC_DELIVERY_WORKERS,
+    thread_name_prefix="payv7-delivery",
+)
 
 # ========== Indexes ==========
 c_users.create_index([("user_id", ASCENDING)], unique=True)
@@ -116,6 +257,7 @@ c_paylog.create_index([("ts", ASCENDING)])
 # One order per user/channel (your original logic)
 c_orders.create_index([("user_id", ASCENDING), ("channel_id", ASCENDING)], unique=True)
 c_broadcast_deletes.create_index([("delete_at", ASCENDING)])
+c_broadcast_deletes.create_index([("kind", ASCENDING), ("delete_at", ASCENDING)])
 c_special_post_cycles.create_index([("user_id", ASCENDING), ("item_id", ASCENDING)], unique=True)
 c_special_post_cycles.create_index([("next_send_at", ASCENDING)])
 
@@ -176,8 +318,106 @@ def cfg(key, default=None):
 def set_cfg(key, value):
     c_config.update_one({"key": key}, {"$set": {"value": value}}, upsert=True)
 
+class DeliveryTargetUnavailable(Exception):
+    """The destination user chat is unavailable, so retries are wasted."""
+
+class TransientDeliveryFailure(Exception):
+    """Temporary Telegram delivery failure such as flood control or network timeouts."""
+
+    def __init__(self, message: str, retry_after_seconds: float = None):
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
+def _is_target_chat_unavailable_error(exc: Exception) -> bool:
+    msg = str(exc or "").lower()
+    return any(pat in msg for pat in (
+        "bot was blocked by the user",
+        "user is deactivated",
+        "chat not found",
+        "bot can't initiate conversation with a user",
+    ))
+
+def _delivery_api_call(func, *args, timeout=DELIVERY_REQUEST_TIMEOUT, **kwargs):
+    last_err = None
+    retry_after_seconds = None
+    call_kwargs = dict(kwargs)
+    if timeout is not None and "timeout" not in call_kwargs:
+        call_kwargs["timeout"] = timeout
+
+    for attempt in range(DELIVERY_MAX_RETRIES):
+        try:
+            return func(*args, **call_kwargs)
+        except RetryAfter as e:
+            last_err = e
+            retry_after_seconds = max(float(getattr(e, "retry_after", 1) or 1), 1.0)
+            if attempt == DELIVERY_MAX_RETRIES - 1:
+                break
+            time.sleep(retry_after_seconds + 0.1)
+        except (TimedOut, NetworkError) as e:
+            last_err = e
+            retry_after_seconds = DELIVERY_NETWORK_RETRY_BASE_SECONDS * (attempt + 1)
+            if attempt == DELIVERY_MAX_RETRIES - 1:
+                break
+            time.sleep(retry_after_seconds)
+
+    raise TransientDeliveryFailure(str(last_err or "delivery retries exhausted"), retry_after_seconds=retry_after_seconds)
+
+def _pace_delivery():
+    if DELIVERY_INTER_MESSAGE_DELAY_SECONDS > 0:
+        time.sleep(DELIVERY_INTER_MESSAGE_DELAY_SECONDS)
+
+def _safe_answer_callback(q, text=None, show_alert=False):
+    try:
+        q.answer(text=text, show_alert=show_alert)
+    except BadRequest as e:
+        msg = str(e or "").lower()
+        if "query is too old" in msg or "query id is invalid" in msg:
+            return
+        raise
+
+def _edit_or_reply_message(message, text, parse_mode=None, reply_markup=None, disable_web_page_preview=False):
+    try:
+        message.edit_text(
+            text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+            disable_web_page_preview=disable_web_page_preview,
+        )
+    except Exception:
+        message.reply_text(
+            text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+            disable_web_page_preview=disable_web_page_preview,
+        )
+
 def amount_key(x: float) -> str:
     return f"{x:.2f}" if abs(x - int(x)) > 1e-9 else str(int(x))
+
+def _write_runtime_heartbeat():
+    try:
+        os.makedirs(os.path.dirname(HEARTBEAT_PATH), exist_ok=True)
+        tmp_path = HEARTBEAT_PATH + ".tmp"
+        with open(tmp_path, "w", encoding="ascii") as fh:
+            fh.write(str(int(time.time())))
+        os.replace(tmp_path, HEARTBEAT_PATH)
+    except Exception as e:
+        log.warning(f"Heartbeat write failed: {e}")
+
+def _update_runtime_heartbeat(context: CallbackContext = None):
+    _write_runtime_heartbeat()
+
+def _dispatch_error_handler(update: object, context: CallbackContext):
+    err = getattr(context, "error", None)
+    if isinstance(err, DeliveryTargetUnavailable):
+        log.info(f"Dispatcher target-unavailable suppressed: {err}")
+        return
+    if isinstance(err, BadRequest):
+        msg = str(err or "").lower()
+        if "query is too old" in msg or "query id is invalid" in msg:
+            log.info(f"Dispatcher callback-timeout suppressed: {err}")
+            return
+    log.exception("Unhandled dispatcher error", exc_info=err)
 
 # === IST helpers ===
 def now_ist(): return datetime.now(IST)
@@ -606,6 +846,14 @@ def get_admin_earnings(admin_id: int):
 # ========== Multi-storage (database channel) helpers ==========
 def get_storage_channels():
     """Returns the configured storage channel list: [main, backup1, backup2, ...]."""
+    global STORAGE_CHANNELS_OVERRIDE
+    if STORAGE_CHANNELS_OVERRIDE is not None:
+        lst = list(STORAGE_CHANNELS_OVERRIDE)
+        if not lst:
+            STORAGE_CHANNELS_OVERRIDE = [int(STORAGE_CHANNEL_ID)]
+            lst = list(STORAGE_CHANNELS_OVERRIDE)
+        return lst
+
     lst = cfg("storage_channels")
     if not isinstance(lst, list) or not lst:
         lst = [int(STORAGE_CHANNEL_ID)]
@@ -625,6 +873,7 @@ def get_storage_channels():
     return out
 
 def set_storage_channels(lst):
+    global STORAGE_CHANNELS_OVERRIDE
     clean = []
     seen = set()
     for x in lst:
@@ -636,6 +885,10 @@ def set_storage_channels(lst):
             continue
     if not clean:
         clean = [int(STORAGE_CHANNEL_ID)]
+    if STORAGE_CHANNELS_OVERRIDE is not None:
+        STORAGE_CHANNELS_OVERRIDE = clean
+        log.info(f"Updated process-local storage channels override: {clean}")
+        return
     set_cfg("storage_channels", clean)
 
 def get_main_storage_channel(): return get_storage_channels()[0]
@@ -645,7 +898,12 @@ def get_backup_storage_channels():
 
 def _storage_titles(context: CallbackContext, ids):
     out = []
+    now_ts = time.time()
     for cid in ids:
+        cached = _storage_title_cache.get(cid)
+        if cached and cached.get("expires_at", 0) > now_ts:
+            out.append((cid, cached.get("title")))
+            continue
         t = None
         try:
             chat = context.bot.get_chat(cid)
@@ -655,6 +913,10 @@ def _storage_titles(context: CallbackContext, ids):
                 t = f"@{chat.username}"
         except Exception:
             t = None
+        _storage_title_cache[cid] = {
+            "title": t,
+            "expires_at": now_ts + STORAGE_TITLE_CACHE_TTL_SECONDS,
+        }
         out.append((cid, t))
     return out
 
@@ -672,7 +934,8 @@ def _ensure_backups_for_product(context: CallbackContext, prod: dict):
     files = prod.get("files", [])
     if not files:
         return
-    storage = get_storage_channels()
+    storage = [int(ch) for ch in get_storage_channels()]
+    storage_set = set(storage)
     main_id = storage[0]
     targets = storage[1:]  # backups to ensure
     changed = False
@@ -683,32 +946,50 @@ def _ensure_backups_for_product(context: CallbackContext, prod: dict):
             f["backups"] = []
             changed = True
 
-        have = set()
+        primary = None
         try:
-            have.add(int(f.get("channel_id")))
+            primary = (int(f.get("channel_id")), int(f.get("message_id")))
         except Exception:
-            pass
+            primary = None
+
+        variants = []
+        if primary:
+            variants.append(primary)
+
+        have = set()
+        if primary and primary[0] in storage_set:
+            have.add(primary[0])
         for b in f["backups"]:
             try:
-                have.add(int(b.get("channel_id")))
+                variant = (int(b.get("channel_id")), int(b.get("message_id")))
             except Exception:
-                pass
+                continue
+            variants.append(variant)
+            if variant[0] in storage_set:
+                have.add(variant[0])
 
         missing = [t for t in targets if t not in have]
-        # choose a reliable source
-        src_ch = int(f.get("channel_id"))
-        src_mid = int(f.get("message_id"))
-        if main_id in have and main_id != src_ch:
-            for b in f["backups"]:
-                if int(b.get("channel_id", 0)) == main_id:
-                    src_ch = main_id
-                    src_mid = int(b.get("message_id"))
-                    break
+        if not missing:
+            continue
+
+        # Only resync from the current storage channels. Older products can still
+        # reference legacy source channels, and hammering those on every startup
+        # burns API budget without ever converging.
+        source_variants = []
+        if primary and primary[0] == main_id:
+            source_variants.append(primary)
+        for variant in variants:
+            if variant[0] in storage_set and variant not in source_variants:
+                source_variants.append(variant)
+        if not source_variants:
+            continue
 
         for tgt in missing:
+            src_ch, src_mid = source_variants[0]
             new_mid = _replicate_file_to_channel(context, src_ch, src_mid, tgt)
             if new_mid:
                 f["backups"].append({"channel_id": int(tgt), "message_id": int(new_mid)})
+                source_variants.append((int(tgt), int(new_mid)))
                 changed = True
                 time.sleep(0.05)
 
@@ -719,11 +1000,21 @@ def _ensure_backups_for_product(context: CallbackContext, prod: dict):
             log.error(f"Persist product backups failed for {prod.get('item_id')}: {e}")
 
 def _resync_all_storage(context: CallbackContext):
-    """Scan all products and ensure files are mirrored to all configured backups."""
-    cur = c_products.find({"files": {"$exists": True, "$ne": []}})
+    """Scan all products and ensure stored content is mirrored to all configured backups."""
+    cur = c_products.find({
+        "$or": [
+            {"files": {"$exists": True, "$ne": []}},
+            {"special_post_record": {"$exists": True}},
+        ]
+    })
     n = 0
     for prod in cur:
-        _ensure_backups_for_product(context, prod)
+        if prod.get("files"):
+            _ensure_backups_for_product(context, prod)
+        if prod.get("special_post_record"):
+            rec, changed = _ensure_backups_for_message_record(context, prod.get("special_post_record"))
+            if changed:
+                c_products.update_one({"_id": prod["_id"]}, {"$set": {"special_post_record": rec}})
         n += 1
         if n % 50 == 0:
             time.sleep(0.2)
@@ -800,19 +1091,90 @@ def _normalize_stored_message(rec):
     return out
 
 def _store_message_record(context: CallbackContext, src_chat_id: int, src_msg_id: int):
-    chs = get_storage_channels()
-    main_id = chs[0]
-    backups = chs[1:]
-    fwd = context.bot.forward_message(main_id, src_chat_id, src_msg_id)
-    rec = {"channel_id": int(fwd.chat_id), "message_id": int(fwd.message_id), "backups": []}
-    for bch in backups:
+    chs = [int(ch) for ch in get_storage_channels()]
+    if not chs:
+        raise RuntimeError("No storage channel is configured")
+
+    rec = None
+    failed_channels = []
+    for channel_id in chs:
         try:
-            cm = context.bot.copy_message(bch, src_chat_id, src_msg_id)
-            rec["backups"].append({"channel_id": int(cm.chat_id), "message_id": int(cm.message_id)})
+            stored = context.bot.copy_message(channel_id, src_chat_id, src_msg_id)
+            variant = {"channel_id": channel_id, "message_id": int(stored.message_id)}
+            if rec is None:
+                rec = {**variant, "backups": []}
+            else:
+                rec["backups"].append(variant)
             time.sleep(0.1)
         except Exception as e:
-            log.error(f"Mirror to backup {bch} failed: {e}")
+            failed_channels.append((channel_id, e))
+            log.error(f"Store message in channel {channel_id} failed: {e}")
+
+    if rec is None:
+        details = "; ".join(f"{channel_id}: {error}" for channel_id, error in failed_channels)
+        raise RuntimeError(f"No configured storage channel accepted the post ({details})")
+
+    # Keep a working channel first so future writes and reads do not repeatedly
+    # hit a deleted/inaccessible primary while a configured backup is healthy.
+    if rec["channel_id"] != chs[0]:
+        healthy_first = [rec["channel_id"]] + [ch for ch in chs if ch != rec["channel_id"]]
+        set_storage_channels(healthy_first)
+        log.warning(
+            "Promoted storage channel %s after primary %s rejected a write",
+            rec["channel_id"],
+            chs[0],
+        )
     return rec
+
+def _ensure_backups_for_message_record(context: CallbackContext, rec):
+    """Ensure a stored message record is mirrored to every configured backup channel."""
+    rec = _normalize_stored_message(rec)
+    if not rec:
+        return None, False
+
+    storage = [int(ch) for ch in get_storage_channels()]
+    storage_set = set(storage)
+    main_id = storage[0]
+    targets = storage[1:]
+
+    primary = (int(rec.get("channel_id")), int(rec.get("message_id")))
+    variants = [primary]
+    have = {primary[0]} if primary[0] in storage_set else set()
+
+    for b in rec.get("backups") or []:
+        try:
+            variant = (int(b.get("channel_id")), int(b.get("message_id")))
+        except Exception:
+            continue
+        if variant not in variants:
+            variants.append(variant)
+        if variant[0] in storage_set:
+            have.add(variant[0])
+
+    missing = [t for t in targets if t not in have]
+    if not missing:
+        return rec, False
+
+    source_variants = []
+    if primary[0] == main_id and primary[0] in storage_set:
+        source_variants.append(primary)
+    for variant in variants:
+        if variant[0] in storage_set and variant not in source_variants:
+            source_variants.append(variant)
+    if not source_variants:
+        return rec, False
+
+    changed = False
+    for tgt in missing:
+        src_ch, src_mid = source_variants[0]
+        new_mid = _replicate_file_to_channel(context, src_ch, src_mid, tgt)
+        if new_mid:
+            rec.setdefault("backups", []).append({"channel_id": int(tgt), "message_id": int(new_mid)})
+            source_variants.append((int(tgt), int(new_mid)))
+            changed = True
+            time.sleep(0.05)
+
+    return rec, changed
 
 def _copy_stored_message_to_chat(context: CallbackContext, chat_id: int, rec, protect_content: bool = False):
     rec = _normalize_stored_message(rec)
@@ -848,7 +1210,8 @@ def _copy_stored_message_to_chat(context: CallbackContext, chat_id: int, rec, pr
 
     for from_ch, msg_id in variants:
         try:
-            m = context.bot.copy_message(
+            m = _delivery_api_call(
+                context.bot.copy_message,
                 chat_id=chat_id,
                 from_chat_id=int(from_ch),
                 message_id=int(msg_id),
@@ -857,17 +1220,37 @@ def _copy_stored_message_to_chat(context: CallbackContext, chat_id: int, rec, pr
             if int(from_ch) == int(main_storage):
                 _record_storage_success_on_main()
             return int(m.message_id)
+        except TransientDeliveryFailure:
+            raise
         except Exception as e:
+            if _is_target_chat_unavailable_error(e):
+                raise DeliveryTargetUnavailable(str(e))
             log.error(f"Copy stored message failed from {from_ch}/{msg_id}: {e}")
             _record_storage_failure(context, int(from_ch))
     return None
 
+def _invalidate_startup_config_cache():
+    _start_post_cache["expires_at"] = 0.0
+    _start_message_delete_cache["expires_at"] = 0.0
+
 def _start_post_record():
-    return _normalize_stored_message(cfg("start_post_record"))
+    now_ts = time.time()
+    if _start_post_cache.get("expires_at", 0.0) <= now_ts:
+        _start_post_cache["value"] = _normalize_stored_message(cfg("start_post_record"))
+        _start_post_cache["expires_at"] = now_ts + START_CONFIG_CACHE_TTL_SECONDS
+    return _normalize_stored_message(_start_post_cache.get("value"))
 
 def _start_message_delete_minutes() -> int:
+    now_ts = time.time()
+    if _start_message_delete_cache.get("expires_at", 0.0) <= now_ts:
+        try:
+            mins = int(cfg("start_message_delete_minutes", 0) or 0)
+        except Exception:
+            mins = 0
+        _start_message_delete_cache["value"] = max(mins, 0)
+        _start_message_delete_cache["expires_at"] = now_ts + START_CONFIG_CACHE_TTL_SECONDS
     try:
-        mins = int(cfg("start_message_delete_minutes", 0) or 0)
+        mins = int(_start_message_delete_cache.get("value", 0) or 0)
     except Exception:
         mins = 0
     return max(mins, 0)
@@ -876,23 +1259,20 @@ def _queue_auto_delete(context: CallbackContext, chat_id: int, message_ids, minu
     ids = [int(mid) for mid in (message_ids or []) if mid]
     if minutes <= 0 or not ids:
         return
-    context.job_queue.run_once(
-        _auto_delete_messages,
-        timedelta(minutes=minutes),
-        context={"chat_id": int(chat_id), "message_ids": ids},
-        name=f"{prefix}_{int(chat_id)}_{int(time.time())}",
-    )
+    _queue_persisted_delete(chat_id, ids, minutes, kind=prefix)
 
-def _queue_persisted_delete(chat_id: int, message_ids, minutes: int):
+def _queue_persisted_delete(chat_id: int, message_ids, minutes: int, kind: str = "autodel"):
     ids = [int(mid) for mid in (message_ids or []) if mid]
     if minutes <= 0 or not ids:
         return
+    delete_kind = (kind or "autodel").strip().lower() or "autodel"
     delete_at = datetime.now(UTC) + timedelta(minutes=minutes)
     created_at = datetime.now(UTC)
     docs = [
         {
             "chat_id": int(chat_id),
             "message_id": int(mid),
+            "kind": delete_kind,
             "delete_at": delete_at,
             "created_at": created_at,
         }
@@ -948,7 +1328,18 @@ def _deliver_special_post(context: CallbackContext, uid: int, item_id: str, prod
             log.error(f"Special post missing notify failed (to {uid}): {e}")
         return []
 
-    sent_ids = _deliver_special_post_copy(context, uid, prod)
+    try:
+        sent_ids = _deliver_special_post_copy(context, uid, prod)
+    except DeliveryTargetUnavailable as e:
+        log.info(f"Special post delivery skipped for {uid}: {e}")
+        return []
+    except TransientDeliveryFailure as e:
+        log.warning(f"Special post delivery throttled for {uid} item {item_id}: {e}")
+        try:
+            context.bot.send_message(uid, "⏳ Telegram is busy right now. Please try this link again in a few seconds.")
+        except Exception as ee:
+            log.error(f"Special post throttle notify failed (to {uid}): {ee}")
+        return []
     if not sent_ids:
         try:
             context.bot.send_message(uid, "⚠️ This special post is not available right now.")
@@ -1047,6 +1438,61 @@ def _refresh_state_for_today(upi_entry):
         st = c_upi_state.find_one({"upi": upi})
     return st
 
+def _daily_max_for_upi(upi_entry, fallback_state=None):
+    rmin = upi_entry.get("rand_min"); rmax = upi_entry.get("rand_max"); mx = upi_entry.get("max_txn")
+    if rmin is not None and rmax is not None:
+        try:
+            rmin_i, rmax_i = int(rmin), int(rmax)
+            if rmax_i < rmin_i:
+                rmin_i, rmax_i = rmax_i, rmin_i
+            return random.randint(rmin_i, rmax_i)
+        except Exception:
+            pass
+    if mx is not None:
+        try:
+            return int(mx)
+        except Exception:
+            return None
+    return (fallback_state or {}).get("daily_max")
+
+def _refresh_upi_states_for_today(pool):
+    upis = [u.get("upi") for u in (pool or []) if u.get("upi")]
+    if not upis:
+        return {}
+
+    today = today_ist_str()
+    state_map = {
+        doc.get("upi"): doc
+        for doc in c_upi_state.find({"upi": {"$in": upis}})
+        if doc.get("upi")
+    }
+    out = {}
+
+    for upi_entry in pool:
+        upi = upi_entry.get("upi")
+        if not upi:
+            continue
+        st = state_map.get(upi)
+        if st and st.get("date") == today:
+            out[upi] = st
+            continue
+
+        prev_amt_today = (st or {}).get("amt_today", 0.0)
+        prev_amt_all = (st or {}).get("amt_all", 0.0)
+        refreshed = {
+            "upi": upi,
+            "date": today,
+            "count": 0,
+            "daily_max": _daily_max_for_upi(upi_entry, st),
+            "amt_yday": prev_amt_today if st else 0.0,
+            "amt_today": 0.0,
+            "amt_all": prev_amt_all if st else 0.0,
+        }
+        c_upi_state.update_one({"upi": upi}, {"$set": refreshed}, upsert=True)
+        out[upi] = refreshed
+
+    return out
+
 def _get_main_upi(pool):
     for u in pool:
         if u.get("main"): return u
@@ -1112,6 +1558,77 @@ def build_upi_uri(amount: float, note: str, upi_id: str):
 def qr_url(data: str): return f"https://api.qrserver.com/v1/create-qr-code/?data={quote(data, safe='')}&size=512x512&qzone=2"
 
 def add_user(uid, uname): c_users.update_one({"user_id": uid},{"$set":{"username":uname or ""}},upsert=True)
+
+def _user_record_worker():
+    while True:
+        uid, uname = _user_record_queue.get()
+        try:
+            add_user(uid, uname)
+        except Exception as e:
+            log.debug("user record failed for %s: %s", uid, e)
+        finally:
+            _user_record_queue.task_done()
+
+def _ensure_user_record_workers():
+    global _user_record_workers_started
+    if _user_record_workers_started:
+        return
+    with _user_record_workers_lock:
+        if _user_record_workers_started:
+            return
+        for idx in range(USER_RECORD_WORKERS):
+            threading.Thread(
+                target=_user_record_worker,
+                name=f"payv7-user-record-{idx}",
+                daemon=True,
+            ).start()
+        _user_record_workers_started = True
+
+def _record_user_soon(uid, uname):
+    _ensure_user_record_workers()
+    try:
+        _user_record_queue.put_nowait((int(uid), uname))
+    except queue.Full:
+        log.warning("User record queue full; dropping user seen update for %s", uid)
+
+def _get_product_cached(item_id: str):
+    item_id = (item_id or "").strip()
+    if not item_id:
+        return None
+    if PRODUCT_CACHE_TTL_SECONDS > 0:
+        now = time.monotonic()
+        with _product_cache_lock:
+            entry = _product_cache.get(item_id)
+            if entry and entry[0] > now:
+                prod = entry[1]
+                return dict(prod) if prod else None
+    prod = c_products.find_one({"item_id": item_id})
+    if PRODUCT_CACHE_TTL_SECONDS > 0:
+        with _product_cache_lock:
+            _product_cache[item_id] = (time.monotonic() + PRODUCT_CACHE_TTL_SECONDS, dict(prod) if prod else None)
+            if len(_product_cache) > 5000:
+                cutoff = time.monotonic()
+                for key, (expires_at, _) in list(_product_cache.items())[:1000]:
+                    if expires_at <= cutoff:
+                        _product_cache.pop(key, None)
+    return dict(prod) if prod else None
+
+def _claim_start_request(uid: int, item_id: str) -> bool:
+    if START_REQUEST_DEDUPE_SECONDS <= 0:
+        return True
+    now = time.monotonic()
+    key = (int(uid), str(item_id or ""))
+    with _recent_start_lock:
+        expires_at = _recent_start_requests.get(key)
+        if expires_at and expires_at > now:
+            return False
+        _recent_start_requests[key] = now + START_REQUEST_DEDUPE_SECONDS
+        if len(_recent_start_requests) > 200_000:
+            for old_key, old_expiry in list(_recent_start_requests.items())[:20_000]:
+                if old_expiry <= now:
+                    _recent_start_requests.pop(old_key, None)
+        return True
+
 def get_all_user_ids(): return list(c_users.distinct("user_id"))
 
 def reserve_amount_key(k: str, hard_expire_at: datetime) -> bool:
@@ -1226,10 +1743,10 @@ def check_join_cb(update: Update, context: CallbackContext):
     if not need:
         try: q.message.delete()
         except: pass
-        q.answer("Thank you!", show_alert=True)
+        _safe_answer_callback(q, "Thank you!", show_alert=True)
         pend = context.user_data.pop('pending_command', None)
         if pend: return pend['fn'](pend['update'], context)
-    else: q.answer("Still not joined all.", show_alert=True)
+    else: _safe_answer_callback(q, "Still not joined all.", show_alert=True)
 
 def _auto_delete_messages(context: CallbackContext):
     data = context.job.context
@@ -1244,31 +1761,118 @@ def _process_broadcast_deletes(context: CallbackContext):
         return
 
     now = datetime.now(UTC)
-    docs = list(
-        c_broadcast_deletes.find({"delete_at": {"$lte": now}})
-        .sort("delete_at", ASCENDING)
-        .limit(BROADCAST_DELETE_BATCH_SIZE)
-    )
-    if not docs:
-        return
+    stale_cutoff = now - timedelta(minutes=STALE_DELETE_SKIP_AFTER_MINUTES)
+    stale_ids = [
+        doc["_id"]
+        for doc in c_broadcast_deletes.find(
+            {"delete_at": {"$lte": stale_cutoff}},
+            {"_id": 1},
+        ).limit(BROADCAST_DELETE_BATCH_SIZE * 8)
+    ]
+    if stale_ids:
+        c_broadcast_deletes.delete_many({"_id": {"$in": stale_ids}})
 
-    done_ids = []
-    for doc in docs:
-        try:
-            context.bot.delete_message(
-                chat_id=int(doc["chat_id"]),
-                message_id=int(doc["message_id"]),
+    def _fetch_due_delete_docs(limit: int):
+        if limit <= 0:
+            return []
+
+        priority_docs = list(
+            c_broadcast_deletes.find(
+                {
+                    "delete_at": {"$lte": now, "$gt": stale_cutoff},
+                    "kind": {"$in": list(PRIORITY_DELETE_KINDS)},
+                }
             )
-            done_ids.append(doc["_id"])
-        except RetryAfter:
-            break
-        except (TimedOut, NetworkError):
-            continue
-        except Exception:
-            done_ids.append(doc["_id"])
+            .sort("delete_at", ASCENDING)
+            .limit(limit)
+        )
+        if len(priority_docs) >= limit:
+            return priority_docs
 
-    if done_ids:
-        c_broadcast_deletes.delete_many({"_id": {"$in": done_ids}})
+        remaining = limit - len(priority_docs)
+        other_docs = list(
+            c_broadcast_deletes.find(
+                {
+                    "delete_at": {"$lte": now, "$gt": stale_cutoff},
+                    "$or": [
+                        {"kind": {"$exists": False}},
+                        {"kind": {"$nin": list(PRIORITY_DELETE_KINDS)}},
+                    ],
+                }
+            )
+            .sort("delete_at", ASCENDING)
+            .limit(remaining)
+        )
+        return priority_docs + other_docs
+
+    deadline = time.monotonic() + BROADCAST_DELETE_MAX_RUNTIME_SECONDS
+    processed = 0
+    while processed < BROADCAST_DELETE_BATCH_SIZE and time.monotonic() < deadline:
+        fetch_limit = min(BROADCAST_DELETE_FETCH_CHUNK_SIZE, BROADCAST_DELETE_BATCH_SIZE - processed)
+        docs = _fetch_due_delete_docs(fetch_limit)
+        if not docs:
+            return
+
+        done_ids = []
+        for doc in docs:
+            if time.monotonic() >= deadline:
+                break
+            try:
+                context.bot.delete_message(
+                    chat_id=int(doc["chat_id"]),
+                    message_id=int(doc["message_id"]),
+                )
+                done_ids.append(doc["_id"])
+                processed += 1
+            except RetryAfter as e:
+                if done_ids:
+                    c_broadcast_deletes.delete_many({"_id": {"$in": done_ids}})
+                try:
+                    retry_after = float(getattr(e, "retry_after", 1) or 1)
+                except Exception:
+                    retry_after = 1.0
+                retry_delay = min(max(retry_after, 1.0), 30.0)
+                try:
+                    c_broadcast_deletes.update_one(
+                        {"_id": doc["_id"]},
+                        {
+                            "$set": {
+                                "delete_at": datetime.now(UTC) + timedelta(seconds=retry_delay),
+                                "last_error": f"retry_after:{retry_delay}",
+                                "last_error_at": datetime.now(UTC),
+                            },
+                            "$inc": {"retry_count": 1},
+                        },
+                    )
+                except Exception:
+                    pass
+                return
+            except (TimedOut, NetworkError) as e:
+                processed += 1
+                try:
+                    c_broadcast_deletes.update_one(
+                        {"_id": doc["_id"]},
+                        {
+                            "$set": {
+                                "delete_at": datetime.now(UTC) + timedelta(seconds=15),
+                                "last_error": str(e)[:200],
+                                "last_error_at": datetime.now(UTC),
+                            },
+                            "$inc": {"retry_count": 1},
+                        },
+                    )
+                except Exception:
+                    pass
+                continue
+            except Exception:
+                done_ids.append(doc["_id"])
+                processed += 1
+
+        if done_ids:
+            c_broadcast_deletes.delete_many({"_id": {"$in": done_ids}})
+
+        if len(docs) < fetch_limit:
+            return
 
 def _process_special_post_cycles(context: CallbackContext):
     now = datetime.now(UTC)
@@ -1294,7 +1898,25 @@ def _process_special_post_cycles(context: CallbackContext):
             c_special_post_cycles.delete_one({"_id": doc["_id"]})
             continue
 
-        sent_ids = _deliver_special_post_copy(context, uid, prod)
+        try:
+            sent_ids = _deliver_special_post_copy(context, uid, prod)
+        except DeliveryTargetUnavailable as e:
+            log.info("special post cycle removed user=%s item=%s: %s", uid, item_id, e)
+            c_special_post_cycles.delete_one({"_id": doc["_id"]})
+            continue
+        except TransientDeliveryFailure as e:
+            retry_after_seconds = max(int(float(e.retry_after_seconds or 30)), 30)
+            c_special_post_cycles.update_one(
+                {"_id": doc["_id"]},
+                {"$set": {"next_send_at": now + timedelta(seconds=retry_after_seconds), "updated_at": now}},
+            )
+            log.info(
+                "special post resend deferred user=%s item=%s retry_after=%ss",
+                uid,
+                item_id,
+                retry_after_seconds,
+            )
+            continue
         if not sent_ids:
             log.warning("special post resend failed user=%s item=%s; cycle removed", uid, item_id)
             c_special_post_cycles.delete_one({"_id": doc["_id"]})
@@ -1325,7 +1947,7 @@ def _delete_unpaid_qr(context: CallbackContext):
 
 # --- Purchase flow (files unchanged in UX; storage behavior enhanced) ---
 def start_purchase(ctx: CallbackContext, chat_id: int, uid: int, item_id: str):
-    prod = c_products.find_one({"item_id": item_id})
+    prod = _get_product_cached(item_id)
     if not prod: return ctx.bot.send_message(chat_id, "❌ Item not found.")
 
     if _is_special_post_product(prod):
@@ -1339,14 +1961,9 @@ def start_purchase(ctx: CallbackContext, chat_id: int, uid: int, item_id: str):
     if mn is None or mx is None:
         v=float(prod.get("price",0))
         if v == 0:
-            deliver_ids = deliver(ctx, uid, item_id, return_ids=True, notify_on_fail=True, is_free=True) or []
+            deliver_ids = deliver(ctx, uid, item_id, return_ids=True, notify_on_fail=True, is_free=True, product=prod) or []
             if deliver_ids:
-                ctx.job_queue.run_once(
-                    _auto_delete_messages,
-                    timedelta(minutes=DELETE_AFTER_MINUTES),
-                    context={"chat_id": chat_id, "message_ids": deliver_ids},
-                    name=f"free_del_{uid}_{int(time.time())}"
-                )
+                _queue_auto_delete(ctx, chat_id, deliver_ids, DELETE_AFTER_MINUTES, prefix="free_del")
             if "channel_id" in prod:
                 try:
                     c_orders.update_one(
@@ -1362,14 +1979,9 @@ def start_purchase(ctx: CallbackContext, chat_id: int, uid: int, item_id: str):
     else:
         try:
             if float(mn) == float(mx) == 0:
-                deliver_ids = deliver(ctx, uid, item_id, return_ids=True, notify_on_fail=True, is_free=True) or []
+                deliver_ids = deliver(ctx, uid, item_id, return_ids=True, notify_on_fail=True, is_free=True, product=prod) or []
                 if deliver_ids:
-                    ctx.job_queue.run_once(
-                        _auto_delete_messages,
-                        timedelta(minutes=DELETE_AFTER_MINUTES),
-                        context={"chat_id": chat_id, "message_ids": deliver_ids},
-                        name=f"free_del_{uid}_{int(time.time())}"
-                    )
+                    _queue_auto_delete(ctx, chat_id, deliver_ids, DELETE_AFTER_MINUTES, prefix="free_del")
                 if "channel_id" in prod:
                     try:
                         c_orders.update_one(
@@ -1426,6 +2038,7 @@ def deliver(
     return_ids: bool = False,
     notify_on_fail: bool = False,
     is_free: bool = False,
+    product: dict = None,
 ):
     """
     Deliver product:
@@ -1433,7 +2046,7 @@ def deliver(
       - Channel: create a request-to-join invite link (fallback regular/public/existing) and DM it.
       - notify_on_fail: if True, tell user to contact support when link generation fails.
     """
-    prod = c_products.find_one({"item_id": item_id})
+    prod = product or _get_product_cached(item_id)
     if not prod:
         try: ctx.bot.send_message(uid, "❌ Item missing.")
         except Exception as e: log.error(f"Notify missing item failed (to {uid}): {e}")
@@ -1499,7 +2112,7 @@ def deliver(
             return [m.message_id] if return_ids else None
         except Exception as e:
             log.error(f"Send channel link failed (to {uid}): {e}")
-            if notify_on_fail:
+            if notify_on_fail and not _is_target_chat_unavailable_error(e):
                 sup = cfg("support_contact")
                 txt = "⚠️ This Channel is not available right now. Please contact support"
                 txt += f" {sup}." if sup else "."
@@ -1510,11 +2123,21 @@ def deliver(
     # Files product — multi-storage variants & failover
     def _copy_variant(from_ch, msg_id):
         try:
-            m = ctx.bot.copy_message(chat_id=uid, from_chat_id=int(from_ch), message_id=int(msg_id), protect_content=PROTECT_CONTENT_ENABLED)
-            if int(from_ch) == int(get_main_storage_channel()):
+            m = _delivery_api_call(
+                ctx.bot.copy_message,
+                chat_id=uid,
+                from_chat_id=int(from_ch),
+                message_id=int(msg_id),
+                protect_content=PROTECT_CONTENT_ENABLED,
+            )
+            if int(from_ch) == int(main_storage):
                 _record_storage_success_on_main()
             return m.message_id
+        except TransientDeliveryFailure:
+            raise
         except Exception as e:
+            if _is_target_chat_unavailable_error(e):
+                raise DeliveryTargetUnavailable(str(e))
             log.error(f"Copy to user failed from {from_ch}/{msg_id}: {e}")
             _record_storage_failure(ctx, int(from_ch))
             return None
@@ -1549,13 +2172,24 @@ def deliver(
 
         delivered = False
         for ch_id, mid in variants:
-            m_id = _copy_variant(ch_id, mid)
+            try:
+                m_id = _copy_variant(ch_id, mid)
+            except DeliveryTargetUnavailable as e:
+                log.info(f"File delivery skipped for {uid}: {e}")
+                return [] if return_ids else None
+            except TransientDeliveryFailure as e:
+                log.warning(f"File delivery throttled for {uid} item {item_id}: {e}")
+                return msg_ids if return_ids else None
             if m_id:
                 msg_ids.append(m_id)
+                _pace_delivery()
                 if free_file_text:
                     try:
-                        txt_msg = ctx.bot.send_message(uid, free_file_text)
+                        txt_msg = _delivery_api_call(ctx.bot.send_message, chat_id=uid, text=free_file_text)
                         msg_ids.append(txt_msg.message_id)
+                        _pace_delivery()
+                    except TransientDeliveryFailure as e:
+                        log.warning(f"Free file text throttled for {uid}: {e}")
                     except Exception as e:
                         log.error(f"Free file text send failed (to {uid}): {e}")
                 delivered = True
@@ -1564,8 +2198,11 @@ def deliver(
         if not delivered:
             log.error(f"All storage variants failed for a file of item {item_id}")
 
-    try: ctx.bot.send_message(uid, "⚠️ Files auto-delete here in 30 minutes. Save now.")
-    except Exception as e: log.error(f"Warn send fail (to {uid}): {e}")
+    if msg_ids:
+        try: _delivery_api_call(ctx.bot.send_message, chat_id=uid, text="⚠️ Files auto-delete here in 30 minutes. Save now.")
+        except TransientDeliveryFailure as e:
+            log.warning(f"Auto-delete warning throttled for {uid}: {e}")
+        except Exception as e: log.error(f"Warn send fail (to {uid}): {e}")
 
     return msg_ids if return_ids else None
 
@@ -1592,87 +2229,51 @@ def on_channel_post(update: Update, context: CallbackContext):
 
     matches = list(c_sessions.find({"amount_key": akey, "created_at": {"$lte": ts}, "hard_expire_at": {"$gte": ts}}))
     for s in matches:
-        qr_mid = s.get("qr_message_id")
+        claimed = c_sessions.find_one_and_update(
+            {"_id": s["_id"], "processing": {"$ne": True}},
+            {"$set": {"processing": True, "processing_at": datetime.now(UTC)}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if not claimed:
+            continue
+
+        qr_mid = claimed.get("qr_message_id")
         if qr_mid:
-            try: context.bot.delete_message(chat_id=s["chat_id"], message_id=qr_mid)
+            try: context.bot.delete_message(chat_id=claimed["chat_id"], message_id=qr_mid)
             except Exception as e: log.debug(f"Delete QR failed: {e}")
 
         try:
-            confirm_msg = context.bot.send_message(s["chat_id"], "✅ Payment received. Delivering your item…")
+            confirm_msg = context.bot.send_message(claimed["chat_id"], "✅ Payment received. Delivering your item…")
             confirm_msg_id = confirm_msg.message_id
         except Exception as e:
             log.warning(f"Notify user fail: {e}")
             confirm_msg_id = None
 
-        ids_to_delete = []
-        if confirm_msg_id: ids_to_delete.append(confirm_msg_id)
-
-        deliver_ids = deliver(context, s["user_id"], s["item_id"], return_ids=True, notify_on_fail=False)
-        ids_to_delete.extend(deliver_ids or [])
-
-        prod = c_products.find_one({"item_id": s["item_id"]}) or {}
-        order_id = gen_order_id()
-        receipt_msg_id = None
-        link_msg_id = (deliver_ids[0] if deliver_ids else None)
-
-        # Record earning for the admin
-        admin_id = s.get("admin_id", OWNER_ID)
-        if admin_id and amt > 0:
-            record_earning(admin_id, amt, order_id, s["item_id"], s["user_id"])
-
-        if "channel_id" in prod:
-            try:
-                c_orders.update_one(
-                    {"user_id": s["user_id"], "channel_id": int(prod["channel_id"])},
-                    {"$set": {
-                        "item_id": s["item_id"], "paid_at": ts, "status": "paid",
-                        "order_id": order_id, "amount": float(s.get("amount", 0.0)),
-                        "admin_id": admin_id,
-                        "receipt_message_id": None, "link_message_id": link_msg_id
-                    }},
-                    upsert=True
-                )
-            except Exception as e:
-                log.error(f"Order upsert failed: {e}")
-
-            try:
-                receipt_text = (
-                    "🧾 *Receipt*\n"
-                    f"*Order ID:* `{order_id}` _(Tap to copy)_\n"
-                    "\n"
-                    "_Join via the link I sent . Keep this message._"
-                )
-                r = context.bot.send_message(s["user_id"], receipt_text, parse_mode=ParseMode.MARKDOWN)
-                receipt_msg_id = r.message_id
-                c_orders.update_one(
-                    {"user_id": s["user_id"], "channel_id": int(prod["channel_id"])},
-                    {"$set": {"receipt_message_id": receipt_msg_id}}
-                )
-            except Exception as e:
-                log.error(f"Send receipt failed: {e}")
-
-            if not deliver_ids:
-                sup = cfg("support_contact")
-                txt = "⚠️ This Channel is not available right now. Please contact support"
-                txt += f" {sup}." if sup else "."
-                try: context.bot.send_message(s["user_id"], txt)
-                except Exception as e: log.error(f"Notify support contact failed: {e}")
-
-        used_upi = s.get("upi_id")
-        if used_upi:
-            try: _bump_usage(used_upi); _bump_amount(used_upi, s.get("amount", 0.0))
-            except Exception as e: log.warning(f"UPI usage/amount bump failed for {used_upi}: {e}")
-
-        if ids_to_delete:
-            context.job_queue.run_once(
-                _auto_delete_messages,
-                timedelta(minutes=DELETE_AFTER_MINUTES),
-                context={"chat_id": s["chat_id"], "message_ids": ids_to_delete},
-                name=f"del_{s['user_id']}_{int(time.time())}"
+        accepted = _submit_async_delivery(
+            context.job_queue,
+            f"paid_session user={claimed['user_id']} item={claimed['item_id']}",
+            _process_paid_session_delivery,
+            claimed,
+            ts,
+            confirm_msg_id,
+        )
+        if not accepted:
+            c_sessions.update_one(
+                {"_id": claimed["_id"]},
+                {"$set": {
+                    "processing": False,
+                    "processing_error": "delivery_queue_full",
+                    "processing_updated_at": datetime.now(UTC),
+                }},
             )
-
-        c_sessions.delete_one({"_id": s["_id"]})
-        release_amount_key(akey)
+            try:
+                context.bot.send_message(
+                    claimed["chat_id"],
+                    "Payment received. Delivery is delayed due to heavy traffic.",
+                    timeout=BOT_REQUEST_READ_TIMEOUT,
+                )
+            except Exception:
+                pass
 
 # ---- Auto-approve join-requests for paid buyers ----
 def on_join_request(update: Update, context: CallbackContext):
@@ -1947,10 +2548,197 @@ def _render_broadcast_done(snapshot: dict) -> str:
 def _broadcast_make_bot():
     req = Request(
         con_pool_size=BROADCAST_WORKERS + 4,
-        connect_timeout=5.0,
-        read_timeout=BROADCAST_REQUEST_TIMEOUT,
+        connect_timeout=BOT_REQUEST_CONNECT_TIMEOUT,
+        read_timeout=max(BROADCAST_REQUEST_TIMEOUT, BOT_REQUEST_READ_TIMEOUT),
     )
-    return Bot(token=TOKEN, request=req)
+    return Bot(
+        token=TOKEN,
+        base_url=BOT_API_BASE_URL,
+        base_file_url=BOT_API_BASE_FILE_URL,
+        request=req,
+    )
+
+def _make_main_bot():
+    req = Request(
+        con_pool_size=BOT_REQUEST_POOL_SIZE,
+        connect_timeout=BOT_REQUEST_CONNECT_TIMEOUT,
+        read_timeout=BOT_REQUEST_READ_TIMEOUT,
+    )
+    return Bot(
+        token=TOKEN,
+        base_url=BOT_API_BASE_URL,
+        base_file_url=BOT_API_BASE_FILE_URL,
+        request=req,
+    )
+
+def _make_async_context(job_queue):
+    return SimpleNamespace(bot=_make_main_bot(), job_queue=job_queue)
+
+def _start_update_receiver(updater):
+    if BOT_UPDATE_MODE == "webhook":
+        base_url = WEBHOOK_BASE_URL or (f"https://{WEBHOOK_DOMAIN}" if WEBHOOK_DOMAIN else "")
+        if not base_url:
+            raise RuntimeError("WEBHOOK_BASE_URL or WEBHOOK_DOMAIN is required for webhook mode.")
+        webhook_url = f"{base_url}{WEBHOOK_URL_PATH}"
+        log.info(
+            "Bot running in webhook mode listen=%s port=%s path=/%s/<redacted>",
+            WEBHOOK_LISTEN,
+            WEBHOOK_PORT,
+            WEBHOOK_PATH_PREFIX,
+        )
+        updater.start_webhook(
+            listen=WEBHOOK_LISTEN,
+            port=WEBHOOK_PORT,
+            url_path=WEBHOOK_URL_PATH,
+            webhook_url=webhook_url,
+            allowed_updates=POLLING_ALLOWED_UPDATES,
+            drop_pending_updates=WEBHOOK_DROP_PENDING_UPDATES,
+            bootstrap_retries=WEBHOOK_BOOTSTRAP_RETRIES,
+            ip_address=WEBHOOK_IP_ADDRESS,
+            max_connections=WEBHOOK_MAX_CONNECTIONS,
+        )
+        return
+
+    log.info("Bot running in polling mode...")
+    try:
+        updater.bot.delete_webhook()
+    except Exception as e:
+        log.warning("Clearing webhook failed: %s", e)
+    updater.start_polling(
+        timeout=20,
+        read_latency=0.1,
+        allowed_updates=POLLING_ALLOWED_UPDATES,
+        drop_pending_updates=False,
+    )
+
+def _submit_async_delivery(job_queue, label: str, handler, *args, **kwargs):
+    global _async_delivery_pending
+    with _async_delivery_pending_lock:
+        if _async_delivery_pending >= ASYNC_DELIVERY_MAX_PENDING:
+            log.error(
+                "Async delivery queue full pending=%s limit=%s label=%s",
+                _async_delivery_pending,
+                ASYNC_DELIVERY_MAX_PENDING,
+                label,
+            )
+            return False
+        _async_delivery_pending += 1
+
+    def _runner():
+        global _async_delivery_pending
+        ctx = _make_async_context(job_queue)
+        try:
+            handler(ctx, *args, **kwargs)
+        except DeliveryTargetUnavailable as e:
+            log.info(f"Async delivery skipped {label}: {e}")
+        except TransientDeliveryFailure as e:
+            log.warning(f"Async delivery throttled {label}: {e}")
+        except Exception:
+            log.exception(f"Async delivery crashed: {label}")
+        finally:
+            with _async_delivery_pending_lock:
+                _async_delivery_pending = max(0, _async_delivery_pending - 1)
+
+    try:
+        _async_delivery_executor.submit(_runner)
+    except Exception:
+        with _async_delivery_pending_lock:
+            _async_delivery_pending = max(0, _async_delivery_pending - 1)
+        raise
+    return True
+
+def _process_paid_session_delivery(ctx, session_doc: dict, ts: datetime, confirm_msg_id=None):
+    s = dict(session_doc or {})
+    session_id = s.get("_id")
+    akey = s.get("amount_key")
+    try:
+        ids_to_delete = []
+        if confirm_msg_id:
+            ids_to_delete.append(int(confirm_msg_id))
+
+        prod = _get_product_cached(s["item_id"]) or {}
+        deliver_ids = deliver(ctx, s["user_id"], s["item_id"], return_ids=True, notify_on_fail=False, product=prod)
+        ids_to_delete.extend(deliver_ids or [])
+
+        order_id = gen_order_id()
+        link_msg_id = (deliver_ids[0] if deliver_ids else None)
+
+        admin_id = s.get("admin_id", OWNER_ID)
+        amount = float(s.get("amount", 0.0) or 0.0)
+        if admin_id and amount > 0:
+            record_earning(admin_id, amount, order_id, s["item_id"], s["user_id"])
+
+        if "channel_id" in prod:
+            try:
+                c_orders.update_one(
+                    {"user_id": s["user_id"], "channel_id": int(prod["channel_id"])},
+                    {"$set": {
+                        "item_id": s["item_id"], "paid_at": ts, "status": "paid",
+                        "order_id": order_id, "amount": amount,
+                        "admin_id": admin_id,
+                        "receipt_message_id": None, "link_message_id": link_msg_id
+                    }},
+                    upsert=True
+                )
+            except Exception as e:
+                log.error(f"Order upsert failed: {e}")
+
+            try:
+                receipt_text = (
+                    "🧾 *Receipt*\n"
+                    f"*Order ID:* `{order_id}` _(Tap to copy)_\n"
+                    "\n"
+                    "_Join via the link I sent . Keep this message._"
+                )
+                r = ctx.bot.send_message(s["user_id"], receipt_text, parse_mode=ParseMode.MARKDOWN)
+                c_orders.update_one(
+                    {"user_id": s["user_id"], "channel_id": int(prod["channel_id"])},
+                    {"$set": {"receipt_message_id": r.message_id}}
+                )
+            except Exception as e:
+                log.error(f"Send receipt failed: {e}")
+
+            if not deliver_ids:
+                sup = cfg("support_contact")
+                txt = "⚠️ This Channel is not available right now. Please contact support"
+                txt += f" {sup}." if sup else "."
+                try:
+                    ctx.bot.send_message(s["user_id"], txt)
+                except Exception as e:
+                    log.error(f"Notify support contact failed: {e}")
+
+        used_upi = s.get("upi_id")
+        if used_upi:
+            try:
+                _bump_usage(used_upi)
+                _bump_amount(used_upi, amount)
+            except Exception as e:
+                log.warning(f"UPI usage/amount bump failed for {used_upi}: {e}")
+
+        if ids_to_delete:
+            _queue_auto_delete(ctx, s["chat_id"], ids_to_delete, DELETE_AFTER_MINUTES, prefix="paidflow")
+
+        c_sessions.delete_one({"_id": session_id})
+        if akey:
+            release_amount_key(akey)
+    except Exception as e:
+        if session_id is not None:
+            c_sessions.update_one(
+                {"_id": session_id},
+                {"$set": {
+                    "processing": False,
+                    "processing_error": str(e)[:500],
+                    "processing_updated_at": datetime.now(UTC),
+                }},
+            )
+        sup = cfg("support_contact")
+        txt = "⚠️ Payment received but delivery is delayed."
+        txt += f" Contact support {sup}." if sup else " Please wait a moment and try again."
+        try:
+            ctx.bot.send_message(s["chat_id"], txt)
+        except Exception:
+            pass
+        raise
 
 def _broadcast_delete_dead_users(user_ids):
     ids = list(user_ids)
@@ -2160,7 +2948,7 @@ def add_product_start(update: Update, context: CallbackContext):
             for bch in backups:
                 try:
                     cm = context.bot.copy_message(bch, update.message.chat_id, update.message.message_id)
-                    rec["backups"].append({"channel_id": cm.chat_id, "message_id": cm.message_id})
+                    rec["backups"].append({"channel_id": int(bch), "message_id": int(cm.message_id)})
                     time.sleep(0.1)
                 except Exception as e:
                     log.error(f"Mirror to backup {bch} failed: {e}")
@@ -2184,7 +2972,7 @@ def get_product_files(update: Update, context: CallbackContext):
         for bch in backups:
             try:
                 cm = context.bot.copy_message(bch, update.message.chat_id, update.message.message_id)
-                rec["backups"].append({"channel_id": cm.chat_id, "message_id": cm.message_id})
+                rec["backups"].append({"channel_id": int(bch), "message_id": int(cm.message_id)})
                 time.sleep(0.1)
             except Exception as e:
                 log.error(f"Mirror to backup {bch} failed: {e}")
@@ -2346,7 +3134,7 @@ def bc_start(update: Update, context: CallbackContext):
     if snap.get("active"):
         q = update.callback_query
         if q:
-            q.answer("Broadcast already running.")
+            _safe_answer_callback(q, "Broadcast already running.")
             q.message.reply_text(_render_broadcast_status(snap))
         else:
             update.message.reply_text(_render_broadcast_status(snap))
@@ -2365,7 +3153,7 @@ def bc_start(update: Update, context: CallbackContext):
     context.user_data["b_target_ids"] = None
     context.user_data["__broadcast_mode__"] = True
     if q:
-        q.answer()
+        _safe_answer_callback(q)
         q.message.reply_text(
             "Send files for broadcast. /done when finished."
             if mode == "all"
@@ -2454,7 +3242,7 @@ def bc_confirm(update, context):
 
 def bc_send(update, context):
     q = update.callback_query
-    q.answer()
+    _safe_answer_callback(q)
 
     files = [
         {"chat_id": int(m.chat_id), "message_id": int(m.message_id)}
@@ -2497,7 +3285,7 @@ def bc_send(update, context):
 
 def bc_cancel(update, context):
     q = update.callback_query
-    q.answer("Broadcast cancelled.")
+    _safe_answer_callback(q, "Broadcast cancelled.")
     q.edit_message_text("Broadcast cancelled.")
     _clear_broadcast_state(context)
     return ConversationHandler.END
@@ -2508,10 +3296,10 @@ def on_cb(update: Update, context: CallbackContext):
     if data == "check_join":
         return check_join_cb(update, context)
     if q.from_user.id not in ALL_ADMINS:
-        q.answer("Not allowed.", show_alert=True)
+        _safe_answer_callback(q, "Not allowed.", show_alert=True)
         return
     if data == "admin:startmenu":
-        q.answer()
+        _safe_answer_callback(q)
         q.edit_message_text(
             _render_admin_start_panel(q.from_user.id),
             parse_mode=ParseMode.HTML,
@@ -2519,7 +3307,7 @@ def on_cb(update: Update, context: CallbackContext):
         )
         return
     if data == "admin:bcdel":
-        q.answer()
+        _safe_answer_callback(q)
         q.message.reply_text(
             _broadcast_delete_menu_text(),
             parse_mode=ParseMode.HTML,
@@ -2530,10 +3318,10 @@ def on_cb(update: Update, context: CallbackContext):
         try:
             mins = int(data.split(":")[-1])
         except Exception:
-            q.answer("Invalid value.", show_alert=True)
+            _safe_answer_callback(q, "Invalid value.", show_alert=True)
             return
         set_cfg("broadcast_delete_minutes", max(mins, 0))
-        q.answer("Broadcast auto-delete updated.")
+        _safe_answer_callback(q, "Broadcast auto-delete updated.")
         q.edit_message_text(
             _broadcast_delete_menu_text(),
             parse_mode=ParseMode.HTML,
@@ -2541,7 +3329,7 @@ def on_cb(update: Update, context: CallbackContext):
         )
         return
     if data == "admin:settings" and q.from_user.id == OWNER_ID:
-        q.answer()
+        _safe_answer_callback(q)
         q.message.reply_text(
             _render_settings_text(),
             parse_mode=ParseMode.MARKDOWN,
@@ -2553,13 +3341,13 @@ def on_cb(update: Update, context: CallbackContext):
 (UPI_ADD_UPI, UPI_ADD_MIN, UPI_ADD_MAX, UPI_ADD_LIMIT, UPI_ADD_MAIN,
  UPI_EDIT_NAME, UPI_EDIT_MIN, UPI_EDIT_MAX, UPI_EDIT_LIMIT) = range(100, 109)
 
-def _force_status_text():
+def _force_status_text(pool=None):
     f = cfg("force_upi")
     if f and isinstance(f, dict) and f.get("upi"):
         rt = "yes" if f.get("respect_txn") else "no"
         ra = "yes" if f.get("respect_amount") else "no"
         nm = None
-        for u in get_upi_pool():
+        for u in (pool or get_upi_pool()):
             if u.get("upi") == f["upi"]:
                 nm = u.get("name"); break
         label = f"`{f['upi']}`" + (f" ({nm})" if nm else "")
@@ -2576,6 +3364,7 @@ def _force_status_text():
 
 def _render_settings_text():
     pool = get_upi_pool()
+    state_map = _refresh_upi_states_for_today(pool)
     lines = ["*Current UPI Configuration* (resets daily at 12:00 AM IST)\n"]
     sup = cfg("support_contact")
     start_post = _start_post_record()
@@ -2589,7 +3378,7 @@ def _render_settings_text():
     lines.append(f"*Start message auto-delete:* {'OFF' if start_delete_mins <= 0 else f'{start_delete_mins} min'}")
     lines.append(f"*Default free file text:* {'set' if default_free_file_text else 'OFF'}")
     lines.append("")
-    lines.append(_force_status_text())
+    lines.append(_force_status_text(pool))
     lines.append("")
     if not pool:
         lines.append("No UPI IDs configured yet. Tap ➕ Add UPI.")
@@ -2599,7 +3388,8 @@ def _render_settings_text():
     fr_txn = "yes" if (isinstance(f, dict) and f.get("respect_txn")) else "no"
     fr_amt = "yes" if (isinstance(f, dict) and f.get("respect_amount")) else "no"
     for i, u in enumerate(pool, 1):
-        st = _refresh_state_for_today(u); used = st.get("count", 0); dmax = st.get("daily_max")
+        st = state_map.get(u.get("upi")) or _refresh_state_for_today(u)
+        used = st.get("count", 0); dmax = st.get("daily_max")
         rng  = f"{u.get('min_amt', 'none')} – {u.get('max_amt', 'none')}"
         lim_label = "none"
         if u.get("rand_min") is not None and u.get("rand_max") is not None:
@@ -2693,19 +3483,19 @@ def _storage_keyboard(context: CallbackContext):
 def storage_menu_cb(update: Update, context: CallbackContext):
     # Only owner can access storage settings
     if update.effective_user.id != OWNER_ID: return
-    q = update.callback_query; q.answer()
+    q = update.callback_query; _safe_answer_callback(q)
     q.message.reply_text(_render_storage_text(context), parse_mode=ParseMode.MARKDOWN, reply_markup=_storage_keyboard(context))
 
 def storage_resync_cb(update: Update, context: CallbackContext):
     # Only owner can access storage settings
     if update.effective_user.id != OWNER_ID: return
-    q = update.callback_query; q.answer("Resync started.")
+    q = update.callback_query; _safe_answer_callback(q, "Resync started.")
     context.job_queue.run_once(_resync_job_to_chat, when=1, context={"chat_id": q.message.chat_id})
 
 def storage_add_cb(update: Update, context: CallbackContext):
     # Only owner can access storage settings
     if update.effective_user.id != OWNER_ID: return
-    q = update.callback_query; q.answer()
+    q = update.callback_query; _safe_answer_callback(q)
     _clear_owner_settings_capture_state(context)
     context.user_data["__await_storage_add__"] = True
     q.message.reply_text("Send the *channel reference* for backup (numeric `-100...`, `@username`, or `https://t.me/...`).", parse_mode=ParseMode.MARKDOWN)
@@ -2713,7 +3503,7 @@ def storage_add_cb(update: Update, context: CallbackContext):
 def storage_make_main_cb(update: Update, context: CallbackContext):
     # Only owner can access storage settings
     if update.effective_user.id != OWNER_ID: return
-    q = update.callback_query; q.answer()
+    q = update.callback_query; _safe_answer_callback(q)
     try:
         idx = int((q.data or "").split(":")[-1])
     except Exception:
@@ -2733,7 +3523,7 @@ def storage_make_main_cb(update: Update, context: CallbackContext):
 def storage_del_cb(update: Update, context: CallbackContext):
     # Only owner can access storage settings
     if update.effective_user.id != OWNER_ID: return
-    q = update.callback_query; q.answer()
+    q = update.callback_query; _safe_answer_callback(q)
     try:
         idx = int((q.data or "").split(":")[-1])
     except Exception:
@@ -2755,7 +3545,7 @@ def storage_del_cb(update: Update, context: CallbackContext):
 def cfg_support_cb(update: Update, context: CallbackContext):
     # Only owner can access settings
     if update.effective_user.id != OWNER_ID: return
-    q = update.callback_query; q.answer()
+    q = update.callback_query; _safe_answer_callback(q)
     _clear_owner_settings_capture_state(context)
     context.user_data["__await_support__"] = True
     sup = cfg("support_contact")
@@ -2770,7 +3560,7 @@ def cfg_start_post_cb(update: Update, context: CallbackContext):
     if update.effective_user.id != OWNER_ID:
         return
     q = update.callback_query
-    q.answer()
+    _safe_answer_callback(q)
     _clear_owner_settings_capture_state(context)
     context.user_data["__await_start_post__"] = True
     current = "configured" if _start_post_record() else "not set"
@@ -2785,7 +3575,7 @@ def cfg_start_message_delete_cb(update: Update, context: CallbackContext):
     if update.effective_user.id != OWNER_ID:
         return
     q = update.callback_query
-    q.answer()
+    _safe_answer_callback(q)
     _clear_owner_settings_capture_state(context)
     context.user_data["__await_start_message_delete__"] = True
     mins = _start_message_delete_minutes()
@@ -2801,7 +3591,7 @@ def cfg_default_free_file_text_cb(update: Update, context: CallbackContext):
     if update.effective_user.id != OWNER_ID:
         return
     q = update.callback_query
-    q.answer()
+    _safe_answer_callback(q)
     _clear_owner_settings_capture_state(context)
     context.user_data["__await_default_free_file_text__"] = True
     current = "set" if (cfg("default_free_file_text") or "").strip() else "OFF"
@@ -2831,6 +3621,7 @@ def start_post_capture_router(update: Update, context: CallbackContext):
     if low in ("clear", "none", "-", "remove", "/clear"):
         context.user_data.pop("__await_start_post__", None)
         set_cfg("start_post_record", None)
+        _invalidate_startup_config_cache()
         msg.reply_text("✅ Startup post cleared.")
         _settings_refresh(msg.chat_id, context)
         raise DispatcherHandlerStop()
@@ -2846,6 +3637,7 @@ def start_post_capture_router(update: Update, context: CallbackContext):
     try:
         rec = _store_message_record(context, msg.chat_id, msg.message_id)
         set_cfg("start_post_record", rec)
+        _invalidate_startup_config_cache()
         context.user_data.pop("__await_start_post__", None)
         mins = _start_message_delete_minutes()
         msg.reply_text(f"✅ Startup post saved. Auto-delete: {'OFF' if mins <= 0 else f'{mins} min'}.")
@@ -2963,12 +3755,12 @@ def special_post_cb(update: Update, context: CallbackContext):
     if not q:
         return
     if q.from_user.id not in ALL_ADMINS:
-        q.answer("Not allowed.", show_alert=True)
+        _safe_answer_callback(q, "Not allowed.", show_alert=True)
         return
 
     data = q.data or ""
     if data == "admin:specialpost":
-        q.answer()
+        _safe_answer_callback(q)
         _open_special_post_builder(update, context)
         return
 
@@ -2976,7 +3768,7 @@ def special_post_cb(update: Update, context: CallbackContext):
         return
 
     if not context.user_data.get("__await_special_post__", False):
-        q.answer("No active special post builder.", show_alert=True)
+        _safe_answer_callback(q, "No active special post builder.", show_alert=True)
         return
 
     action = data.split(":", 1)[1]
@@ -2998,7 +3790,7 @@ def special_post_cb(update: Update, context: CallbackContext):
             )
 
     if action == "cycles":
-        q.answer()
+        _safe_answer_callback(q)
         try:
             q.message.edit_text(
                 _special_post_cycles_text(context),
@@ -3016,7 +3808,7 @@ def special_post_cb(update: Update, context: CallbackContext):
         return
 
     if action == "resend":
-        q.answer()
+        _safe_answer_callback(q)
         context.user_data.pop("__await_special_post_delete_minutes__", None)
         context.user_data.pop("__await_special_post_cycles_manual__", None)
         context.user_data["__await_special_post_repeat_minutes__"] = True
@@ -3029,7 +3821,7 @@ def special_post_cb(update: Update, context: CallbackContext):
         return
 
     if action == "delete":
-        q.answer()
+        _safe_answer_callback(q)
         context.user_data.pop("__await_special_post_repeat_minutes__", None)
         context.user_data.pop("__await_special_post_cycles_manual__", None)
         context.user_data["__await_special_post_delete_minutes__"] = True
@@ -3045,15 +3837,15 @@ def special_post_cb(update: Update, context: CallbackContext):
         try:
             cycles = int(action.split(":")[-1])
         except Exception:
-            q.answer("Invalid cycle count.", show_alert=True)
+            _safe_answer_callback(q, "Invalid cycle count.", show_alert=True)
             return
         context.user_data["__special_post_cycles__"] = _special_post_cycle_count(cycles)
-        q.answer("Cycle count updated.")
+        _safe_answer_callback(q, "Cycle count updated.")
         _edit_builder()
         return
 
     if action == "cycles_manual":
-        q.answer()
+        _safe_answer_callback(q)
         context.user_data.pop("__await_special_post_repeat_minutes__", None)
         context.user_data.pop("__await_special_post_delete_minutes__", None)
         context.user_data["__await_special_post_cycles_manual__"] = True
@@ -3066,7 +3858,7 @@ def special_post_cb(update: Update, context: CallbackContext):
         return
 
     if action == "back":
-        q.answer()
+        _safe_answer_callback(q)
         context.user_data.pop("__await_special_post_cycles_manual__", None)
         context.user_data.pop("__await_special_post_repeat_minutes__", None)
         context.user_data.pop("__await_special_post_delete_minutes__", None)
@@ -3074,7 +3866,7 @@ def special_post_cb(update: Update, context: CallbackContext):
         return
 
     if action == "cancel":
-        q.answer("Cancelled.")
+        _safe_answer_callback(q, "Cancelled.")
         _clear_special_post_state(context)
         try:
             q.message.edit_text("❌ Special post creation cancelled.")
@@ -3085,7 +3877,7 @@ def special_post_cb(update: Update, context: CallbackContext):
     if action == "save":
         rec = _normalize_stored_message(context.user_data.get("__special_post_record__"))
         if not rec:
-            q.answer("Send or forward the post first.", show_alert=True)
+            _safe_answer_callback(q, "Send or forward the post first.", show_alert=True)
             return
 
         item_id = (context.user_data.get("__special_post_item_id__") or "").strip()
@@ -3105,6 +3897,7 @@ def special_post_cb(update: Update, context: CallbackContext):
             "special_post_delete_minutes": delete_minutes,
             "added_by": q.from_user.id,
         }
+        _safe_answer_callback(q, "Saving special post...")
         try:
             if is_edit:
                 c_products.update_one({"item_id": item_id}, {"$set": doc})
@@ -3112,8 +3905,8 @@ def special_post_cb(update: Update, context: CallbackContext):
                 c_products.insert_one({"item_id": item_id, **doc})
             _clear_special_post_state(context)
             link = f"https://t.me/{context.bot.username}?start={item_id}"
-            q.answer("Special post updated." if is_edit else "Special post created.")
-            q.message.edit_text(
+            _edit_or_reply_message(
+                q.message,
                 ("✅ Special post updated.\n" if is_edit else "✅ Special post created.\n")
                 + f"Repeat cycles: {cycles}\n"
                 + f"Resend timer: {repeat_minutes} minute{'s' if repeat_minutes != 1 else ''}\n"
@@ -3124,7 +3917,7 @@ def special_post_cb(update: Update, context: CallbackContext):
             )
         except Exception as e:
             log.error(f"Special post create failed: {e}")
-            q.answer("Failed to create special post.", show_alert=True)
+            q.message.reply_text("❌ Failed to save the special post. Try again.")
         return
 
 def admin_text_router(update: Update, context: CallbackContext):
@@ -3290,6 +4083,7 @@ def admin_text_router(update: Update, context: CallbackContext):
         raw = t.lower()
         if raw in ("off", "0", "none", "disable"):
             set_cfg("start_message_delete_minutes", 0)
+            _invalidate_startup_config_cache()
             update.message.reply_text("✅ Start message auto-delete turned OFF.")
             _settings_refresh(update.effective_chat.id, context)
             return
@@ -3304,6 +4098,7 @@ def admin_text_router(update: Update, context: CallbackContext):
             context.user_data["__await_start_message_delete__"] = True
             return
         set_cfg("start_message_delete_minutes", mins)
+        _invalidate_startup_config_cache()
         update.message.reply_text(f"✅ Start message auto-delete set to {mins} minutes.")
         _settings_refresh(update.effective_chat.id, context)
         return
@@ -3365,12 +4160,7 @@ def admin_text_router(update: Update, context: CallbackContext):
         f"\n*Admin ID:* `{admin_id}`"
     )
     m = update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
-    context.job_queue.run_once(
-        _auto_delete_messages,
-        timedelta(minutes=10),
-        context={"chat_id": m.chat_id, "message_ids": [m.message_id]},
-        name=f"admrec_{int(time.time())}"
-    )
+    _queue_auto_delete(context, m.chat_id, [m.message_id], 10, prefix="admrec")
 
 
 def editln_cb(update: Update, context: CallbackContext):
@@ -3379,7 +4169,7 @@ def editln_cb(update: Update, context: CallbackContext):
         return
     uid = q.from_user.id
     if uid not in ALL_ADMINS:
-        q.answer()
+        _safe_answer_callback(q)
         return
 
     data = q.data or ""
@@ -3388,13 +4178,13 @@ def editln_cb(update: Update, context: CallbackContext):
 
     item_id = context.user_data.get("__edit_link_item_id__")
     if not item_id:
-        q.answer("No active edit.", show_alert=True)
+        _safe_answer_callback(q, "No active edit.", show_alert=True)
         return
 
     prod = c_products.find_one({"item_id": item_id})
     if not prod:
         _clear_edit_link_state(context)
-        q.answer("Item not found anymore.", show_alert=True)
+        _safe_answer_callback(q, "Item not found anymore.", show_alert=True)
         try:
             q.message.edit_text("❌ Item not found anymore.")
         except Exception:
@@ -3403,7 +4193,7 @@ def editln_cb(update: Update, context: CallbackContext):
 
     if not _is_editable_link_product(prod):
         _clear_edit_link_state(context)
-        q.answer("This link can't be edited here.", show_alert=True)
+        _safe_answer_callback(q, "This link can't be edited here.", show_alert=True)
         return
 
     changes = context.user_data.setdefault("__edit_link_changes__", {})
@@ -3419,7 +4209,7 @@ def editln_cb(update: Update, context: CallbackContext):
             q.message.reply_text(txt, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True)
 
     if action == "cancel":
-        q.answer()
+        _safe_answer_callback(q)
         _clear_edit_link_state(context)
         try:
             q.message.edit_text("❌ Cancelled.")
@@ -3428,20 +4218,20 @@ def editln_cb(update: Update, context: CallbackContext):
         return
 
     if action == "ch":
-        q.answer()
+        _safe_answer_callback(q)
         context.user_data["__await_edit_channel__"] = True
         q.message.reply_text("Send the new channel ID / @username / t.me link.")
         return
 
     if action == "ch_keep":
-        q.answer()
+        _safe_answer_callback(q)
         changes.pop("channel_id", None)
         context.user_data.pop("__await_edit_channel__", None)
         _show_menu()
         return
 
     if action == "files":
-        q.answer()
+        _safe_answer_callback(q)
         context.user_data["__await_edit_files__"] = True
         context.user_data["__edit_new_files__"] = []
         q.message.reply_text(
@@ -3454,7 +4244,7 @@ def editln_cb(update: Update, context: CallbackContext):
         return
 
     if action == "files_keep":
-        q.answer()
+        _safe_answer_callback(q)
         changes.pop("files", None)
         context.user_data.pop("__await_edit_files__", None)
         context.user_data.pop("__edit_new_files__", None)
@@ -3464,9 +4254,9 @@ def editln_cb(update: Update, context: CallbackContext):
     if action == "files_done":
         new_files = context.user_data.get("__edit_new_files__") or []
         if not new_files:
-            q.answer("Send at least one file first.", show_alert=True)
+            _safe_answer_callback(q, "Send at least one file first.", show_alert=True)
             return
-        q.answer()
+        _safe_answer_callback(q)
         changes["files"] = new_files
         context.user_data.pop("__await_edit_files__", None)
         context.user_data.pop("__edit_new_files__", None)
@@ -3474,13 +4264,13 @@ def editln_cb(update: Update, context: CallbackContext):
         return
 
     if action == "price":
-        q.answer()
+        _safe_answer_callback(q)
         context.user_data["__await_edit_price__"] = True
         q.message.reply_text("Send new price like `10` or `10-30`.", parse_mode=ParseMode.MARKDOWN)
         return
 
     if action == "price_keep":
-        q.answer()
+        _safe_answer_callback(q)
         for k in ("min_price", "max_price"):
             changes.pop(k, None)
         context.user_data.pop("__await_edit_price__", None)
@@ -3488,18 +4278,19 @@ def editln_cb(update: Update, context: CallbackContext):
         return
 
     if action == "back":
-        q.answer()
+        _safe_answer_callback(q)
         context.user_data.pop("__await_edit_free_file_text__", None)
         _show_menu()
         return
 
     if action == "freetext":
         if "files" not in prod:
-            q.answer("Only available for file links.", show_alert=True)
+            _safe_answer_callback(q, "Only available for file links.", show_alert=True)
             return
         context.user_data["__await_edit_free_file_text__"] = True
         free_text_state = _free_file_text_state(prod, changes)
-        q.answer(
+        _safe_answer_callback(
+            q,
             _free_file_text_alert_text(
                 free_text_state["previous_text"],
                 free_text_state["previous_source"],
@@ -3574,9 +4365,9 @@ def editln_cb(update: Update, context: CallbackContext):
 
     if action == "freetext_clear":
         if "files" not in prod:
-            q.answer("Only available for file links.", show_alert=True)
+            _safe_answer_callback(q, "Only available for file links.", show_alert=True)
             return
-        q.answer()
+        _safe_answer_callback(q)
         changes["free_file_text"] = None
         context.user_data.pop("__await_edit_free_file_text__", None)
         _show_menu()
@@ -3608,11 +4399,11 @@ def editln_cb(update: Update, context: CallbackContext):
         # If price not changed, keep existing price field as-is.
 
         if not set_doc and not unset_doc:
-            q.answer("Nothing changed.", show_alert=True)
+            _safe_answer_callback(q, "Nothing changed.", show_alert=True)
             _show_menu()
             return
 
-        q.answer()
+        _safe_answer_callback(q)
         update = {}
         if set_doc: update["$set"] = set_doc
         if unset_doc: update["$unset"] = unset_doc
@@ -3660,7 +4451,7 @@ def admin_edit_files_router(update: Update, context: CallbackContext):
         for bch in backups:
             try:
                 cm = context.bot.copy_message(bch, update.message.chat_id, update.message.message_id)
-                rec["backups"].append({"channel_id": cm.chat_id, "message_id": cm.message_id})
+                rec["backups"].append({"channel_id": int(bch), "message_id": int(cm.message_id)})
                 time.sleep(0.1)
             except Exception as e:
                 log.error(f"Mirror to backup {bch} failed: {e}")
@@ -3693,7 +4484,7 @@ def addupi_cmd(update: Update, context: CallbackContext):
 def addupi_cb_entry(update: Update, context: CallbackContext):
     # Only owner can access UPI settings
     if update.effective_user.id != OWNER_ID: return ConversationHandler.END
-    q = update.callback_query; q.answer()
+    q = update.callback_query; _safe_answer_callback(q)
     context.user_data.clear(); context.user_data["__mode__"]="add"
     q.message.reply_text("Send the UPI ID to add (e.g., dexar@slc).")
     return UPI_ADD_UPI
@@ -4003,7 +4794,7 @@ def upi_add__main(update: Update, context: CallbackContext):
 def edit_cb_entry(update: Update, context: CallbackContext):
     # Only owner can access UPI settings
     if update.effective_user.id != OWNER_ID: return ConversationHandler.END
-    q = update.callback_query; q.answer()
+    q = update.callback_query; _safe_answer_callback(q)
     parts = (q.data or "").split(":")
     try: idx = int(parts[2])
     except Exception:
@@ -4373,7 +5164,7 @@ def upi_edit__limit(update: Update, context: CallbackContext):
 def upi_cb(update: Update, context: CallbackContext):
     # Only owner can access UPI settings
     if update.effective_user.id != OWNER_ID: return
-    q = update.callback_query; q.answer()
+    q = update.callback_query; _safe_answer_callback(q)
     data = q.data or ""; pool = get_upi_pool()
 
     if data == "upi:reset":
@@ -4400,55 +5191,104 @@ def upi_cb(update: Update, context: CallbackContext):
 
 def cmd_start(update: Update, context: CallbackContext):
     uid = update.effective_user.id
-    add_user(uid, update.effective_user.username)
+    uname = update.effective_user.username
+    _record_user_soon(uid, uname)
     msg = update.message or (update.callback_query and update.callback_query.message)
     chat_id = msg.chat_id
-    if context.args:
-        item_id = (context.args[0] or "").strip()
-        if uid in ALL_ADMINS and item_id.startswith("item_"):
-            prod = c_products.find_one({"item_id": item_id})
-            if _is_special_post_product(prod):
-                log.info("admin start-link special-post edit redirect admin=%s item=%s", uid, item_id)
-                _open_special_post_builder(update, context, prod, item_id)
+    try:
+        if context.args:
+            item_id = (context.args[0] or "").strip()
+            prod = None
+            if uid in ALL_ADMINS and item_id.startswith("item_"):
+                prod = c_products.find_one({"item_id": item_id})
+                if _is_special_post_product(prod):
+                    log.info("admin start-link special-post edit redirect admin=%s item=%s", uid, item_id)
+                    _open_special_post_builder(update, context, prod, item_id)
+                    return
+                if _is_editable_link_product(prod):
+                    log.info("admin start-link edit redirect admin=%s item=%s", uid, item_id)
+                    _open_edit_link_menu(update, context, prod, item_id)
+                    return
+            if item_id.startswith("item_"):
+                if prod is None:
+                    prod = _get_product_cached(item_id)
+                if _is_special_post_product(prod):
+                    return _deliver_special_post(context, uid, item_id, prod)
+            if not _claim_start_request(uid, item_id):
                 return
-            if _is_editable_link_product(prod):
-                log.info("admin start-link edit redirect admin=%s item=%s", uid, item_id)
-                _open_edit_link_menu(update, context, prod, item_id)
+            if SEND_START_ACK:
+                try:
+                    ack = msg.reply_text("⏳ Processing your request...")
+                    _queue_auto_delete(
+                        context,
+                        chat_id,
+                        [ack.message_id],
+                        ASYNC_START_ACK_DELETE_MINUTES,
+                        prefix="startack",
+                    )
+                except Exception:
+                    pass
+            accepted = _submit_async_delivery(
+                context.job_queue,
+                f"start_purchase user={uid} item={item_id}",
+                start_purchase,
+                chat_id,
+                uid,
+                item_id,
+            )
+            if not accepted:
+                try:
+                    context.bot.send_message(
+                        chat_id,
+                        "Heavy traffic right now. Please try again in a minute.",
+                        timeout=BOT_REQUEST_READ_TIMEOUT,
+                    )
+                except Exception:
+                    pass
+            return
+
+        sent_ids = []
+        start_post = _start_post_record()
+
+        if start_post:
+            try:
+                sent_mid = _copy_stored_message_to_chat(
+                    context,
+                    chat_id,
+                    start_post,
+                    protect_content=PROTECT_CONTENT_ENABLED,
+                )
+            except DeliveryTargetUnavailable as e:
+                log.info(f"Startup post delivery skipped for {uid}: {e}")
                 return
-        return start_purchase(context, chat_id, uid, item_id)
+            except TransientDeliveryFailure as e:
+                log.warning(f"Startup post delivery throttled for {uid}: {e}")
+                sent_mid = None
+            if sent_mid:
+                sent_ids.append(sent_mid)
+            else:
+                log.warning("Configured startup post could not be delivered; falling back to welcome message.")
 
-    sent_ids = []
-    start_post = _start_post_record()
+        if not sent_ids:
+            photo = cfg("welcome_photo_id")
+            text = cfg("welcome_text", "Welcome!")
+            reply_markup = _admin_start_keyboard(uid) if uid in ALL_ADMINS else None
+            if photo:
+                sent = msg.reply_photo(photo=photo, caption=text, reply_markup=reply_markup)
+            else:
+                sent = msg.reply_text(text, reply_markup=reply_markup)
+            sent_ids.append(sent.message_id)
+        elif uid in ALL_ADMINS:
+            admin_panel = msg.reply_text(
+                _render_admin_start_panel(uid),
+                parse_mode=ParseMode.HTML,
+                reply_markup=_admin_start_keyboard(uid),
+            )
+            sent_ids.append(admin_panel.message_id)
 
-    if start_post:
-        sent_mid = _copy_stored_message_to_chat(
-            context,
-            chat_id,
-            start_post,
-            protect_content=PROTECT_CONTENT_ENABLED,
-        )
-        if sent_mid:
-            sent_ids.append(sent_mid)
-        else:
-            log.warning("Configured startup post could not be delivered; falling back to welcome message.")
-
-    if not sent_ids:
-        photo = cfg("welcome_photo_id")
-        text = cfg("welcome_text", "Welcome!")
-        reply_markup = _admin_start_keyboard(uid) if uid in ALL_ADMINS else None
-        if photo:
-            sent = msg.reply_photo(photo=photo, caption=text, reply_markup=reply_markup)
-        else:
-            sent = msg.reply_text(text, reply_markup=reply_markup)
-        sent_ids.append(sent.message_id)
-    elif uid in ALL_ADMINS:
-        msg.reply_text(
-            _render_admin_start_panel(uid),
-            parse_mode=ParseMode.HTML,
-            reply_markup=_admin_start_keyboard(uid),
-        )
-
-    _queue_auto_delete(context, chat_id, sent_ids, _start_message_delete_minutes(), prefix="startmsg")
+        _queue_auto_delete(context, chat_id, sent_ids, _start_message_delete_minutes(), prefix="startmsg")
+    finally:
+        pass
 
 def main():
     # default seeds
@@ -4466,10 +5306,7 @@ def main():
     if not cfg("storage_channels"):
         set_storage_channels([int(STORAGE_CHANNEL_ID)])
 
-    # clear webhook (if any)
-    os.system(f'curl -s "https://api.telegram.org/bot{TOKEN}/deleteWebhook" >/dev/null')
-
-    updater = Updater(TOKEN, use_context=True)
+    updater = Updater(bot=_make_main_bot(), use_context=True, workers=UPDATER_WORKER_COUNT)
     dp = updater.dispatcher
     admin = Filters.user(ALL_ADMINS)
     owner = Filters.user(OWNER_ID)
@@ -4603,13 +5440,28 @@ def main():
 
     # Text router (must run BEFORE add_channel_conv so edit-link inputs don't get treated as new products)
     dp.add_handler(MessageHandler(Filters.text & admin, admin_text_router), group=-1)
+    dp.add_error_handler(_dispatch_error_handler)
 
     # Startup auto-resync (non-blocking)
-    updater.job_queue.run_once(_resync_all_job, when=2)
-    updater.job_queue.run_repeating(_process_broadcast_deletes, interval=1, first=10, name="broadcast_delete_sweeper")
+    # Keep storage resync manual. A full mirror pass at every boot can flood the
+    # Bot API and hurt live deliveries when many products need repair.
+    _write_runtime_heartbeat()
+    updater.job_queue.run_repeating(
+        _process_broadcast_deletes,
+        interval=BROADCAST_DELETE_SWEEP_INTERVAL_SECONDS,
+        first=BROADCAST_DELETE_SWEEP_INTERVAL_SECONDS,
+        name="broadcast_delete_sweeper",
+    )
     updater.job_queue.run_repeating(_process_special_post_cycles, interval=30, first=30, name="special_post_cycle_sweeper")
+    updater.job_queue.run_repeating(
+        _update_runtime_heartbeat,
+        interval=HEARTBEAT_INTERVAL_SECONDS,
+        first=HEARTBEAT_INTERVAL_SECONDS,
+        name="runtime_heartbeat",
+    )
 
-    logging.info("Bot running…"); updater.start_polling(); updater.idle()
+    _start_update_receiver(updater)
+    updater.idle()
 
 if __name__ == "__main__":
     main()
